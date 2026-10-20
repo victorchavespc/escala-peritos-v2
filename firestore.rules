@@ -1,0 +1,45 @@
+rules_version = '2';
+
+// Regras de segurança do Cloud Firestore para a Escala de Plantões.
+// Copie este conteúdo em: Console do Firebase › Firestore Database › Regras › Publicar.
+//
+// Cada pessoa só lê e grava a PRÓPRIA escala (escalas/{seu uid}), e só se o e-mail estiver na lista abaixo.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // >>> TROQUE pelo(s) e-mail(s) Google autorizados, em letras minúsculas, separados por vírgula. <<<
+    function autorizado() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.lower() in ['seu-email@gmail.com'];
+    }
+
+    function dono(uid) {
+      return autorizado() && request.auth.uid == uid;
+    }
+
+    function jsonValido() {
+      return request.resource.data.json is string
+        && request.resource.data.json.size() < 900000;
+    }
+
+    match /escalas/{uid} {
+      allow read, delete: if dono(uid);
+      allow create, update: if dono(uid) && jsonValido()
+        && request.resource.data.keys().hasOnly(['json', 'rev', 'versao', 'atualizadoEm', 'dispositivo', 'email'])
+        && request.resource.data.rev is int;
+
+      // versões diárias e cópias de segurança
+      match /historico/{versao} {
+        allow read, delete: if dono(uid);
+        allow create, update: if dono(uid) && jsonValido()
+          && request.resource.data.keys().hasOnly(['json', 'rev', 'salvoEm', 'rotulo']);
+      }
+    }
+
+    // Qualquer outro caminho fica fechado.
+    match /{documento=**} {
+      allow read, write: if false;
+    }
+  }
+}
