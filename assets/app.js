@@ -13,6 +13,8 @@
   const CHAVE_PREFS = "escala_npf_prefs";    // preferências deste navegador (tema, visualização, aba)
   const CHAVE_HIST = "escala_npf_hist";      // versões diárias guardadas neste navegador
   const CHAVE_SYNC = "escala_npf_sync";      // controle da sincronização com a nuvem
+  const CHAVE_CACHE = "escala_npf_cache";    // cópia da escala definitiva para quem só visualiza (colaborador/leitor)
+  const CHAVE_SESSAO = "escala_npf_sessao";  // último acesso confirmado: permite abrir sem internet
   const VERSAO_DADOS = 3;
   const MAX_DESFAZER = 80;
   const DIAS_HIST_LOCAL = 14;
@@ -25,6 +27,10 @@
   const INFO_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M8 7.3v3.6M8 5.2h.01"/></svg>';
   const RE_ID = /^[A-Za-z0-9_-]{1,40}$/, RE_ISO = /^\d{4}-\d{2}-\d{2}$/, RE_COR = /^#[0-9a-fA-F]{6}$/, RE_MES = /^\d{4}-\d{1,2}$/, RE_HORA = /^([01]\d|2[0-3]):[0-5]\d$/;
   const CFG = window.ESCALA_CONFIG || {};
+  const NUVEM_ATIVA = !!(CFG.firebase && CFG.firebase.apiKey) && location.protocol !== "file:";
+  const UNIDADE = CFG.unidade || "Itaberaba";
+  const STATUS_PROPOSTA = {rascunho:"Rascunho", enviada:"Enviada", aprovada:"Aprovada", rejeitada:"Rejeitada"};
+  const PAPEIS = {mestre:"Administrador", colaborador:"Colaborador", leitor:"Leitor", local:"Uso local"};
 
   const hoje = new Date();
   let estado = {
@@ -39,6 +45,9 @@
     pincel:null,         // { tipo:'equipe'|'perito'|'borracha', ref:id }
     feriasAberta:null,   // id do perito com painel de afastamentos aberto
     destaque:null,       // id do perito destacado nos calendários
+    papel:null,          // 'local' | 'mestre' | 'colaborador' | 'leitor' (null = ainda sem acesso)
+    visao:null,          // null = escala definitiva; {modo:'editar'|'ver'|'revisar'} = há uma proposta aberta
+    prop:null,           // cópia de trabalho da proposta aberta: {id, mes, dias:{}, equipes:[], observacao, status, ...}
     busca:"",
     viewOficial:"grade", // grade | lista
     viewExtra:"grade"
@@ -49,7 +58,7 @@
   function lerJSON(chave){ try{ const raw=localStorage.getItem(chave); return raw?JSON.parse(raw):null; }catch(e){ return null; } }
   function gravarJSON(chave,valor){ try{ localStorage.setItem(chave, typeof valor==="string"?valor:JSON.stringify(valor)); return true; }catch(e){ return false; } }
   function removerChave(chave){ try{ localStorage.removeItem(chave); }catch(e){} }
-  function salvarPrefs(){ gravarJSON(CHAVE_PREFS,{tema:prefs.tema||"auto", viewOficial:estado.viewOficial, viewExtra:estado.viewExtra, aba:estado.aba}); }
+  function salvarPrefs(){ gravarJSON(CHAVE_PREFS,{tema:prefs.tema||"auto", viewOficial:estado.viewOficial, viewExtra:estado.viewExtra, aba:estado.aba, destaque:estado.destaque||null}); }
 
   const Store = {
     async load(){
@@ -150,11 +159,37 @@
   function canonico(json){ try{ const s=sanitizar(JSON.parse(json)); return JSON.stringify(Object.assign({versao:VERSAO_DADOS},s)); }catch(e){ return ""; } }
   function temDados(){ return !!(estado.peritos.length||estado.equipes.length||Object.keys(estado.extra).some(k=>Object.keys(estado.extra[k]).length)||estado.feriadosExtras.length); }
 
+  // Conteúdo de uma proposta vinda da nuvem: só dias válidos do mês e peritos que existem. Nunca confiar no que chega.
+  function dadosDeProposta(doc){
+    const bruto=(t,padrao)=>{ try{ const v=JSON.parse(t); return v==null?padrao:v; }catch(e){ return padrao; } };
+    const dias=bruto(doc&&doc.dias,{}), equipes=bruto(doc&&doc.equipes,[]);
+    const m=/^(\d{4})-(\d{1,2})$/.exec((doc&&doc.mes)||""), nd=m&&+m[2]>=1&&+m[2]<=12?diasNoMes(+m[1],+m[2]):0;
+    const ids=new Set(estado.peritos.map(p=>p.id)), out={};
+    if(dias&&typeof dias==="object"&&!Array.isArray(dias)) Object.keys(dias).forEach(ds=>{
+      const d=+ds; if(!Number.isInteger(d)||d<1||d>nd||!Array.isArray(dias[ds])) return;
+      const arr=[...new Set(dias[ds].map(String))].filter(id=>ids.has(id)).slice(0,20); if(arr.length) out[d]=arr;
+    });
+    const eqs=(Array.isArray(equipes)?equipes:[]).filter(x=>x&&Array.isArray(x.membros)).map((x,i)=>({
+      id:RE_ID.test(String(x.id||""))?String(x.id):uid(),
+      membros:[...new Set(x.membros.map(String))].filter(id=>ids.has(id)).slice(0,3),
+      cor:RE_COR.test(x.cor)?x.cor:CORES_EQUIPE[i%CORES_EQUIPE.length], recorrente:false, diasPadrao:[]
+    })).filter(e=>e.membros.length);
+    return {dias:out, equipes:eqs};
+  }
+  function saneaProposta(p){
+    const ids=new Set(estado.peritos.map(x=>x.id));
+    Object.keys(p.dias).forEach(d=>{ const arr=p.dias[d].filter(id=>ids.has(id)); if(arr.length) p.dias[d]=arr; else delete p.dias[d]; });
+    p.equipes=p.equipes.map(e=>Object.assign({},e,{membros:e.membros.filter(id=>ids.has(id))})).filter(e=>e.membros.length);
+  }
+
   // ---------- Desfazer / refazer + gravação ----------
   // Cada alteração passa por persistir(): compara a "foto" atual com a anterior e empilha para desfazer.
   const hist = {atual:"", desfazer:[], refazer:[]};
   const ouvintes = [];
+  const ganchosRender = [];
   function persistir(){
+    if(estado.visao){ persistirProposta(); return; }   // com uma proposta aberta, o que muda é a proposta — nunca a definitiva
+    if(!ehEditorDef()) return;
     const json=JSON.stringify(snapshot());
     if(json===hist.atual) return;
     hist.desfazer.push(hist.atual); if(hist.desfazer.length>MAX_DESFAZER) hist.desfazer.shift();
@@ -168,19 +203,49 @@
     atualizarBotoesHist();
     ouvintes.forEach(cb=>{ try{ cb(hist.atual,origem); }catch(e){ console.error(e); } });
   }
+  // Proposta aberta (colaborador editando / administrador revisando): cópia de trabalho própria, com desfazer próprio.
+  const histProp = {atual:"", desfazer:[], refazer:[]};
+  const ouvintesProposta = [];
+  function snapshotProp(){ const p=estado.prop; return p?JSON.stringify({dias:p.dias, equipes:p.equipes, observacao:p.observacao||""}):""; }
+  function avisarProposta(){ const p=estado.prop; ouvintesProposta.forEach(cb=>{ try{ cb(p); }catch(e){ console.error(e); } }); }
+  function persistirProposta(){
+    const p=estado.prop; if(!p||!estado.visao||estado.visao.modo!=="editar") return;
+    const json=snapshotProp(); if(json===histProp.atual) return;
+    histProp.desfazer.push(histProp.atual); if(histProp.desfazer.length>MAX_DESFAZER) histProp.desfazer.shift();
+    histProp.refazer=[]; histProp.atual=json;
+    atualizarBotoesHist(); avisarProposta();
+  }
+  function restaurarProp(json){
+    const p=estado.prop, o=safeParse(json)||{};
+    p.dias=o.dias||{}; p.equipes=o.equipes||[]; p.observacao=o.observacao||"";
+    saneaProposta(p);
+    if(estado.pincel&&estado.pincel.tipo==="equipe"&&!equipePorId(estado.pincel.ref)) estado.pincel=null;
+    avisarProposta();
+  }
   function desfazer(){
-    if(!hist.desfazer.length) return;
+    if(estado.visao){
+      if(estado.visao.modo!=="editar"||!histProp.desfazer.length) return;
+      histProp.refazer.push(histProp.atual); histProp.atual=histProp.desfazer.pop();
+      restaurarProp(histProp.atual); render(); toast("Alteração desfeita."); return;
+    }
+    if(!ehEditorDef()||!hist.desfazer.length) return;
     hist.refazer.push(hist.atual); hist.atual=hist.desfazer.pop();
     aplicarDados(JSON.parse(hist.atual)); gravar("local"); render(); toast("Alteração desfeita.");
   }
   function refazer(){
-    if(!hist.refazer.length) return;
+    if(estado.visao){
+      if(estado.visao.modo!=="editar"||!histProp.refazer.length) return;
+      histProp.desfazer.push(histProp.atual); histProp.atual=histProp.refazer.pop();
+      restaurarProp(histProp.atual); render(); toast("Alteração refeita."); return;
+    }
+    if(!ehEditorDef()||!hist.refazer.length) return;
     hist.desfazer.push(hist.atual); hist.atual=hist.refazer.pop();
     aplicarDados(JSON.parse(hist.atual)); gravar("local"); render(); toast("Alteração refeita.");
   }
   function atualizarBotoesHist(){
-    document.getElementById("undoBtn").disabled=!hist.desfazer.length;
-    document.getElementById("redoBtn").disabled=!hist.refazer.length;
+    const u=document.getElementById("undoBtn"), r=document.getElementById("redoBtn");
+    if(estado.visao){ const ed=estado.visao.modo==="editar"; u.disabled=!ed||!histProp.desfazer.length; r.disabled=!ed||!histProp.refazer.length; }
+    else{ const ed=ehEditorDef(); u.disabled=!ed||!hist.desfazer.length; r.disabled=!ed||!hist.refazer.length; }
   }
 
   // ---------- Helpers de calendário/grupos ----------
@@ -232,7 +297,7 @@
   function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
   function peritosDoGrupo(g){ return estado.peritos.filter(p=>p.grupo===g); }
   function peritoPorId(id){ return estado.peritos.find(p=>p.id===id); }
-  function equipePorId(id){ return estado.equipes.find(e=>e.id===id); }
+  function equipePorId(id){ return equipesEf().find(e=>e.id===id); }
   function ordenarPeritos(lista){ return lista.slice().sort((a,b)=>a.grupo===b.grupo?a.nome.localeCompare(b.nome,"pt"):a.grupo.localeCompare(b.grupo)); }
   function nomeMesAno(ano,mes){ return MESES[mes-1].charAt(0).toUpperCase()+MESES[mes-1].slice(1)+" de "+ano; }
   function plural(n,s,p){ return n+" "+(n===1?s:(p||s+"s")); }
@@ -247,22 +312,62 @@
 
   // ---------- Extra: chaves e parsing ----------
   function chaveMes(ano,mes){ return (ano||estado.ano)+"-"+(mes||estado.mes); }
-  function extraDoMes(ano,mes){ return estado.extra[chaveMes(ano,mes)]||{}; }                  // somente leitura
-  function extraDoMesEditavel(ano,mes){ const k=chaveMes(ano,mes); if(!estado.extra[k]) estado.extra[k]={}; return estado.extra[k]; }
-  function mesFechado(ano,mes){ return estado.fechados.includes(chaveMes(ano,mes)); }
+  // Há proposta aberta E o mês exibido é o dela: o calendário mostra (e edita) os dias da proposta.
+  function visaoAtiva(){ return !!(estado.visao&&estado.prop&&estado.prop.mes===chaveMes()); }
+  function mapaMes(ano,mes,criar){
+    const k=chaveMes(ano,mes);
+    if(estado.visao&&estado.prop&&estado.prop.mes===k) return estado.prop.dias;
+    if(criar&&!estado.extra[k]) estado.extra[k]={};
+    return estado.extra[k]||null;
+  }
+  function extraDoMes(ano,mes){ return mapaMes(ano,mes,false)||{}; }                  // somente leitura
+  function mesFechado(ano,mes){ return estado.fechados.includes(chaveMes(ano,mes)); } // fechado na escala DEFINITIVA
+  function ehEditorDef(){ return estado.papel==="local"||estado.papel==="mestre"; }
+  // Pode alterar o que está na tela agora? Com proposta aberta: só o autor, e só em rascunho.
+  // Sem proposta: só administrador/uso local, e só em mês aberto.
+  function editavelAgora(){
+    if(estado.visao) return visaoAtiva()&&estado.visao.modo==="editar";
+    return ehEditorDef()&&!mesFechado();
+  }
+  function equipesEf(){ return visaoAtiva()?estado.equipes.concat(estado.prop.equipes):estado.equipes; }
+  function equipeLocalDaProposta(e){ return !!(estado.prop&&estado.prop.equipes.includes(e)); }
+  // Todos os meses lançados (a proposta aberta substitui o mês dela), para as contagens de equidade.
+  function todosMapas(){
+    const r=Object.keys(estado.extra).map(k=>({k, m:estado.extra[k]}));
+    if(estado.visao&&estado.prop){ const i=r.findIndex(x=>x.k===estado.prop.mes), x={k:estado.prop.mes, m:estado.prop.dias}; if(i>=0) r[i]=x; else r.push(x); }
+    return r;
+  }
+  // Dias do mês exibido em que a proposta difere da escala definitiva.
+  function diasDiferentes(){
+    const s=new Set(); if(!visaoAtiva()) return s;
+    const def=estado.extra[chaveMes()]||{}, prop=estado.prop.dias, nd=diasNoMes(estado.ano,estado.mes);
+    for(let d=1;d<=nd;d++) if(!mesmoConjunto(def[d]||[],prop[d]||[])) s.add(d);
+    return s;
+  }
+  // Resumo de qualquer proposta (para as listas): diferenças e cotas, conforme os peritos de hoje.
+  function resumoProposta(doc){
+    const dd=dadosDeProposta(doc), m=/^(\d{4})-(\d{1,2})$/.exec((doc&&doc.mes)||"");
+    if(!m) return {dif:0,batem:0,total:estado.peritos.length,dias:0,nd:0};
+    const a=+m[1], mm=+m[2], nd=diasNoMes(a,mm), def=estado.extra[doc.mes]||{};
+    let dif=0; for(let d=1;d<=nd;d++) if(!mesmoConjunto(def[d]||[],dd.dias[d]||[])) dif++;
+    let batem=0; estado.peritos.forEach(p=>{ let n=0; Object.keys(dd.dias).forEach(ds=>{ if(dd.dias[ds].includes(p.id)&&!diaEmFerias(p,a,mm,+ds)) n++; }); if(n===cotaEfetiva(p,a,mm)) batem++; });
+    return {dif, batem, total:estado.peritos.length, dias:Object.keys(dd.dias).length, nd};
+  }
 
   // --- Modelo: cada dia guarda diretamente uma lista de peritos (materializada) ---
   function ocupantesDoDia(d,ano,mes){ const v=extraDoMes(ano,mes)[d]; return Array.isArray(v)?v:[]; }
   function setOcupantes(d,arr,ano,mes){
     const limpo=[...new Set(arr)].filter(id=>peritoPorId(id));
-    if(limpo.length) extraDoMesEditavel(ano,mes)[d]=limpo;
-    else{ const k=chaveMes(ano,mes); if(estado.extra[k]){ delete estado.extra[k][d]; if(!Object.keys(estado.extra[k]).length) delete estado.extra[k]; } }
+    if(limpo.length){ mapaMes(ano,mes,true)[d]=limpo; return; }
+    const k=chaveMes(ano,mes), m=mapaMes(ano,mes,false); if(!m) return;
+    delete m[d];
+    if(m===estado.extra[k]&&!Object.keys(m).length) delete estado.extra[k];
   }
   function mesmoConjunto(a,b){ if(a.length!==b.length) return false; const sa=new Set(a); return b.every(x=>sa.has(x)); }
-  function equipeDoDia(d){ const oc=ocupantesDoDia(d); if(!oc.length) return null; return estado.equipes.find(e=>mesmoConjunto(e.membros,oc))||null; }
+  function equipeDoDia(d){ const oc=ocupantesDoDia(d); if(!oc.length) return null; return equipesEf().find(e=>mesmoConjunto(e.membros,oc))||null; }
   function corDoDia(d){ const oc=ocupantesDoDia(d); if(!oc.length) return null; const eq=equipeDoDia(d); return eq?eq.cor:"#64748B"; }
   function tituloEscala(aba){
-    return (aba==="oficial"?"Escala oficial dos Peritos Criminais":"Escala dos Peritos Criminais")+" · "+nomeMesAno(estado.ano,estado.mes);
+    return (aba==="oficial"?"Escala oficial dos Peritos Criminais":"Escala dos Peritos Criminais")+" · "+nomeMesAno(estado.ano,estado.mes)+(aba!=="oficial"&&visaoAtiva()?" — PROPOSTA (não é a escala definitiva)":"");
   }
 
   function parseDias(txt,maxDia){
@@ -376,6 +481,7 @@
     const ord=ordenarPeritos(estado.peritos).filter(p=>!termo||p.nome.toLocaleLowerCase("pt").includes(termo));
     if(!ord.length){ lista.innerHTML='<div class="vazio">Nenhum perito encontrado para “'+escapar(estado.busca)+'”.</div>'; return; }
     ord.forEach(p=>{
+      const ed=ehEditorDef();
       const nplant=diasDoGrupo(p.grupo,estado.ano,estado.mes).length;
       const temFer=temFeriasNoMes(p,estado.ano,estado.mes);
       const aberto=estado.feriasAberta===p.id;
@@ -383,18 +489,18 @@
 
       const row=document.createElement("div"); row.className="perito";
       row.innerHTML='<span class="dot '+p.grupo+'"></span>'+
-        '<input class="nome-edit" value="'+escapar(p.nome)+'" aria-label="Nome" maxlength="80">'+
-        '<select class="grp-edit" aria-label="Grupo">'+GRUPOS.map(g=>'<option value="'+g+'"'+(g===p.grupo?" selected":"")+'>'+g+'</option>').join("")+'</select>'+
+        '<input class="nome-edit" value="'+escapar(p.nome)+'" aria-label="Nome" maxlength="80"'+(ed?"":" readonly")+'>'+
+        '<select class="grp-edit" aria-label="Grupo"'+(ed?"":" disabled")+'>'+GRUPOS.map(g=>'<option value="'+g+'"'+(g===p.grupo?" selected":"")+'>'+g+'</option>').join("")+'</select>'+
         '<span class="pcont" title="Plantões do grupo no mês">'+nplant+' <small>pl</small></span>'+
         '<button class="fer'+(temFer?" tem":"")+'" aria-label="Férias e afastamentos" aria-expanded="'+aberto+'" title="Férias e afastamentos">'+FER_ICON+'</button>'+
-        '<button class="del" aria-label="Remover" title="Remover perito"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 4h10M6 4V3a1 1 0 011-1h2a1 1 0 011 1v1M5 4l.5 9a1 1 0 001 .9h3a1 1 0 001-.9L12 4"/></svg></button>';
+        (ed?'<button class="del" aria-label="Remover" title="Remover perito"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 4h10M6 4V3a1 1 0 011-1h2a1 1 0 011 1v1M5 4l.5 9a1 1 0 001 .9h3a1 1 0 001-.9L12 4"/></svg></button>':'<span></span>');
       const nomeInp=row.querySelector(".nome-edit");
-      const salvar=()=>{ const v=nomeInp.value.trim().slice(0,80); if(v&&v!==p.nome){ p.nome=v; persistir(); render(); } else if(!v){ nomeInp.value=p.nome; } };
+      const salvar=()=>{ if(!ed) return; const v=nomeInp.value.trim().slice(0,80); if(v&&v!==p.nome){ p.nome=v; persistir(); render(); } else if(!v){ nomeInp.value=p.nome; } };
       nomeInp.addEventListener("blur",salvar);
       nomeInp.addEventListener("keydown",e=>{ if(e.key==="Enter") nomeInp.blur(); if(e.key==="Escape"){ nomeInp.value=p.nome; nomeInp.blur(); } });
-      row.querySelector(".grp-edit").addEventListener("change",e=>{ p.grupo=e.target.value; persistir(); render(); });
+      row.querySelector(".grp-edit").addEventListener("change",e=>{ if(!ed) return; p.grupo=e.target.value; persistir(); render(); });
       row.querySelector(".fer").addEventListener("click",()=>{ estado.feriasAberta=aberto?null:p.id; renderLista(); });
-      row.querySelector(".del").addEventListener("click",()=>removerPerito(p.id));
+      if(ed) row.querySelector(".del").addEventListener("click",()=>removerPerito(p.id));
       wrap.appendChild(row);
 
       if(aberto){
@@ -402,25 +508,27 @@
         const periodos=(p.ferias||[]).slice().sort((a,b)=>(a.ini||"").localeCompare(b.ini||""));
         let ph;
         if(periodos.length){
-          ph='<div class="fer-periodos">'+periodos.map((f,idx)=>'<div class="fer-item"><span class="rng">'+fmtData(f.ini)+' — '+fmtData(f.fim)+'</span><span class="ftipo">'+escapar(TIPOS_AFAST[f.tipo]||"Férias")+'</span><button data-idx="'+idx+'" class="fer-rm" aria-label="Remover período" title="Remover período">✕</button></div>').join("")+'</div>';
+          ph='<div class="fer-periodos">'+periodos.map((f,idx)=>'<div class="fer-item"><span class="rng">'+fmtData(f.ini)+' — '+fmtData(f.fim)+'</span><span class="ftipo">'+escapar(TIPOS_AFAST[f.tipo]||"Férias")+'</span>'+(ed?'<button data-idx="'+idx+'" class="fer-rm" aria-label="Remover período" title="Remover período">✕</button>':'')+'</div>').join("")+'</div>';
         }else{
           ph='<div class="fer-vazio">Nenhum período de férias ou afastamento cadastrado.</div>';
         }
         const dgf=diasGrupoEmFerias(p,estado.ano,estado.mes);
         const resumo = temFer ? '<div class="fer-resumo">Neste mês: '+dgf+' plantão(ões) em afastamento · cota '+cotaPerito(p,estado.ano,estado.mes)+' → '+cotaEfetiva(p,estado.ano,estado.mes)+'</div>' : '';
-        panel.innerHTML=ph+'<div class="fer-add"><select class="fer-tipo" aria-label="Tipo">'+Object.keys(TIPOS_AFAST).map(k=>'<option value="'+k+'">'+TIPOS_AFAST[k]+'</option>').join("")+'</select><input type="date" class="fer-ini" aria-label="Início"><span style="color:var(--tinta-3)">→</span><input type="date" class="fer-fim" aria-label="Fim"><button class="btn-sm solid fer-add-btn">Adicionar</button></div>'+resumo;
+        panel.innerHTML=ph+(ed?'<div class="fer-add"><select class="fer-tipo" aria-label="Tipo">'+Object.keys(TIPOS_AFAST).map(k=>'<option value="'+k+'">'+TIPOS_AFAST[k]+'</option>').join("")+'</select><input type="date" class="fer-ini" aria-label="Início"><span style="color:var(--tinta-3)">→</span><input type="date" class="fer-fim" aria-label="Fim"><button class="btn-sm solid fer-add-btn">Adicionar</button></div>':'')+resumo;
         panel.querySelectorAll(".fer-rm").forEach(b=>b.addEventListener("click",()=>{
           const alvo=periodos[+b.dataset.idx];
           p.ferias=(p.ferias||[]).filter(x=>x!==alvo); persistir(); render();
         }));
-        const ini=panel.querySelector(".fer-ini"), fim=panel.querySelector(".fer-fim");
-        ini.addEventListener("change",()=>{ if(ini.value&&(!fim.value||fim.value<ini.value)) fim.value=ini.value; });
-        panel.querySelector(".fer-add-btn").addEventListener("click",()=>{
-          if(!ini.value||!fim.value){ toast("Informe início e fim do período."); return; }
-          if(fim.value<ini.value){ toast("A data final deve ser igual ou posterior à inicial."); return; }
-          if(!p.ferias) p.ferias=[];
-          p.ferias.push({ini:ini.value,fim:fim.value,tipo:panel.querySelector(".fer-tipo").value}); persistir(); render();
-        });
+        if(ed){
+          const ini=panel.querySelector(".fer-ini"), fim=panel.querySelector(".fer-fim");
+          ini.addEventListener("change",()=>{ if(ini.value&&(!fim.value||fim.value<ini.value)) fim.value=ini.value; });
+          panel.querySelector(".fer-add-btn").addEventListener("click",()=>{
+            if(!ini.value||!fim.value){ toast("Informe início e fim do período."); return; }
+            if(fim.value<ini.value){ toast("A data final deve ser igual ou posterior à inicial."); return; }
+            if(!p.ferias) p.ferias=[];
+            p.ferias.push({ini:ini.value,fim:fim.value,tipo:panel.querySelector(".fer-tipo").value}); persistir(); render();
+          });
+        }
         wrap.appendChild(panel);
       }
       lista.appendChild(wrap);
@@ -450,9 +558,13 @@
     const ord=ordenarPeritos(estado.peritos);
     const opts='<option value="">Destacar perito…</option>'+ord.map(p=>'<option value="'+escapar(p.id)+'"'+(estado.destaque===p.id?" selected":"")+'>'+escapar(p.nome)+' ('+p.grupo+')</option>').join("");
     document.querySelectorAll(".destaque-sel").forEach(s=>{ s.innerHTML=opts; s.disabled=!ord.length; });
-    document.querySelectorAll(".ics-btn").forEach(b=>b.disabled=!estado.destaque);
+    document.querySelectorAll(".ics-btn").forEach(b=>{
+      const proposta=b.dataset.aba==="extra"&&visaoAtiva();
+      b.disabled=!estado.destaque||proposta;
+      b.title=proposta?"A agenda só pode ser baixada da escala definitiva":(b.dataset.aba==="oficial"?"Baixar agenda do perito (.ics) — próximos 12 meses":"Baixar agenda do perito (.ics) deste mês");
+    });
   }
-  function setDestaque(id){ estado.destaque=id||null; renderDestaque(); renderCalendario(); renderTabelaOficial(); renderCalExtra(); renderTabelaExtra(); }
+  function setDestaque(id){ estado.destaque=id||null; salvarPrefs(); renderDestaque(); renderCalendario(); renderTabelaOficial(); renderCalExtra(); renderTabelaExtra(); }
 
   function renderCalendario(){
     const grid=document.getElementById("grid"); grid.innerHTML="";
@@ -492,7 +604,7 @@
 
   function renderTabelaExtra(){
     const tb=document.getElementById("tbodyExtra"); tb.innerHTML="";
-    const nd=diasNoMes(estado.ano,estado.mes), fechado=mesFechado(estado.ano,estado.mes);
+    const nd=diasNoMes(estado.ano,estado.mes), fechado=!editavelAgora(), dif=diasDiferentes();
     tb.parentElement.classList.toggle("com-destaque",!!estado.destaque);
     for(let d=1;d<=nd;d++){
       const dw=diaDaSemana(estado.ano,estado.mes,d), fds=(dw===0||dw===6);
@@ -506,7 +618,7 @@
         cell='<span style="color:var(--tinta-3)">livre</span>';
       }
       const vw = DOW_FULL[dw] + (fnome?'<span class="fer-tag">'+escapar(fnome)+'</span>':'');
-      const tr=document.createElement("tr"); tr.className=[fds?"wknd":"",fnome?"feriado":"",fechado?"":"vt-click",ehHoje(estado.ano,estado.mes,d)?"hoje":"",estado.destaque&&oc.includes(estado.destaque)?"hl":""].filter(Boolean).join(" ");
+      const tr=document.createElement("tr"); tr.className=[fds?"wknd":"",fnome?"feriado":"",fechado?"":"vt-click",ehHoje(estado.ano,estado.mes,d)?"hoje":"",estado.destaque&&oc.includes(estado.destaque)?"hl":"",dif.has(d)?"dif":""].filter(Boolean).join(" ");
       tr.innerHTML='<td class="vd">'+d+'</td><td class="vw">'+vw+'</td><td class="'+cls+'" style="'+style+'">'+cell+'</td>';
       if(!fechado) tr.addEventListener("click",()=>cliqueDia(d));
       tb.appendChild(tr);
@@ -603,6 +715,7 @@
   function icsData(ms){ const d=new Date(ms); return d.getUTCFullYear()+_pad2(d.getUTCMonth()+1)+_pad2(d.getUTCDate())+"T"+_pad2(d.getUTCHours())+_pad2(d.getUTCMinutes())+"00Z"; }
   function exportarICS(aba){
     const p=peritoPorId(estado.destaque); if(!p) return;
+    if(aba==="extra"&&visaoAtiva()){ toast("A agenda só pode ser baixada da escala definitiva."); return; }
     const [hh,mm]=estado.config.horaInicio.split(":").map(Number);
     const eventos=[];
     if(aba==="oficial"){
@@ -640,8 +753,10 @@
     renderTabelaExtra();
     aplicarView("extra");
     renderEquidade();
-    document.getElementById("totalEquipes").textContent=plural(estado.equipes.length,"equipe");
+    document.getElementById("totalEquipes").textContent=plural(equipesEf().length,"equipe");
+    avisarRender();
   }
+  function avisarRender(){ ganchosRender.forEach(cb=>{ try{ cb(); }catch(e){ console.error(e); } }); }
 
   function refreshExtra(){
     renderEquipes();
@@ -651,14 +766,14 @@
     renderCalExtra();
     renderTabelaExtra();
     aplicarView("extra");
+    avisarRender();
   }
 
   // Fins de semana e feriados por perito (no mês e no ano), para distribuir de forma justa.
   function contagensEquidade(){
     const r={}; estado.peritos.forEach(p=>r[p.id]={fdsMes:0,ferMes:0,fdsAno:0,ferAno:0});
-    Object.keys(estado.extra).forEach(k=>{
+    todosMapas().forEach(({k,m:mesObj})=>{
       const [a,m]=k.split("-").map(Number); if(a!==estado.ano) return;
-      const mesObj=estado.extra[k];
       Object.keys(mesObj).forEach(ds=>{
         const d=+ds, dw=diaDaSemana(a,m,d), fds=dw===0||dw===6, fer=!!feriadoNome(a,m,d);
         if(!fds&&!fer) return;
@@ -704,25 +819,26 @@
 
   function renderEquipes(){
     const box=document.getElementById("eqLista"); box.innerHTML="";
-    if(!estado.equipes.length){ box.innerHTML='<div class="vazio"><div class="vt">Nenhuma equipe</div>Crie duplas ou trios acima para montar a escala — ou use o pincel avulso abaixo.</div>'; return; }
+    if(!equipesEf().length){ box.innerHTML='<div class="vazio"><div class="vt">Nenhuma equipe</div>Crie duplas ou trios acima para montar a escala — ou use o pincel avulso abaixo.</div>'; return; }
     const ex=extraDoMes();
-    estado.equipes.forEach(e=>{
+    equipesEf().forEach(e=>{
       const nomes=e.membros.map(id=>nomePessoa(id));
       const diasMes=Object.keys(ex).filter(d=>Array.isArray(ex[d])&&mesmoConjunto(ex[d],e.membros)).map(Number);
       const tipo=e.membros.length===3?"Trio":(e.membros.length===2?"Dupla":"Solo");
       const ativa=estado.pincel&&estado.pincel.tipo==="equipe"&&estado.pincel.ref===e.id;
+      const podeRemover=!visaoAtiva()||equipeLocalDaProposta(e);
       const div=document.createElement("div"); div.className="equipe"+(ativa?" ativa":""); div.style.borderLeftColor=e.cor;
       div.tabIndex=0; div.setAttribute("role","button"); div.setAttribute("aria-pressed",!!ativa);
       div.innerHTML='<div class="eh"><span class="enome"><span class="swatch" style="background:'+e.cor+'"></span>'+escapar(nomes.join(" + "))+'</span>'+
-        '<button class="mini-del" aria-label="Remover equipe" title="Remover equipe (mantém os dias já lançados)"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 4h10M5 4l.5 9a1 1 0 001 .9h3a1 1 0 001-.9L12 4M6 4V3a1 1 0 011-1h2a1 1 0 011 1v1"/></svg></button></div>'+
+        (podeRemover?'<button class="mini-del" aria-label="Remover equipe" title="Remover equipe (mantém os dias já lançados)"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 4h10M5 4l.5 9a1 1 0 001 .9h3a1 1 0 001-.9L12 4M6 4V3a1 1 0 011-1h2a1 1 0 011 1v1"/></svg></button>':'')+'</div>'+
         '<div class="edias">Dias no mês: '+compactaDias(diasMes)+'</div>'+
         '<div class="efoot"><span class="etipo">'+tipo+'</span>'+
-        (e.recorrente?'<span class="rec-flag">recorrente · '+compactaDias(e.diasPadrao||[])+'</span>':'')+
+        (equipeLocalDaProposta(e)?'<span class="rec-flag">só nesta proposta</span>':'')+(e.recorrente?'<span class="rec-flag">recorrente · '+compactaDias(e.diasPadrao||[])+'</span>':'')+
         '<span class="ecount">'+plural(diasMes.length,"dia")+'</span></div>';
       const ativar=()=>{ estado.pincel=ativa?null:{tipo:"equipe",ref:e.id}; atualizarSelecaoPincel(); };
       div.addEventListener("click",ev=>{ if(ev.target.closest(".mini-del")) return; ativar(); });
       div.addEventListener("keydown",ev=>{ if((ev.key==="Enter"||ev.key===" ")&&ev.target===div){ ev.preventDefault(); ativar(); } });
-      div.querySelector(".mini-del").addEventListener("click",()=>removerEquipe(e.id));
+      const md=div.querySelector(".mini-del"); if(md) md.addEventListener("click",()=>removerEquipe(e.id));
       box.appendChild(div);
     });
   }
@@ -746,7 +862,7 @@
 
   function atualizarSelecaoPincel(){
     renderEquipes(); renderAvulso(); renderToolbar();
-    document.getElementById("gridExtra").classList.toggle("pintando",!!estado.pincel&&!mesFechado());
+    document.getElementById("gridExtra").classList.toggle("pintando",!!estado.pincel&&editavelAgora());
   }
 
   function renderValidacao(){
@@ -796,20 +912,35 @@
   }
 
   function renderLockBar(){
-    const fechado=mesFechado(estado.ano,estado.mes);
-    const bar=document.getElementById("lockBar"), txt=document.getElementById("lockTxt"), btn=document.getElementById("lockBtn");
+    const ed=editavelAgora(), proposta=visaoAtiva(), fechado=mesFechado(estado.ano,estado.mes);
+    const bar=document.getElementById("lockBar"), txt=document.getElementById("lockTxt"), btn=document.getElementById("lockBtn"), pb=document.getElementById("propMesBtn");
+    bar.hidden=proposta;                                   // com proposta aberta, quem fala é a barra da proposta
     bar.classList.toggle("locked",fechado);
-    if(fechado){ txt.innerHTML='<b>Mês concluído</b> — edição bloqueada.'; btn.textContent="Reabrir mês"; }
-    else{ txt.textContent="Mês aberto para edição."; btn.textContent="Marcar como concluído"; }
-    ["quickDias","quickBtn","acordoBtn","copiarBtn","limparBtn"].forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=fechado; });
+    if(ehEditorDef()){
+      btn.hidden=false;
+      if(fechado){ txt.innerHTML='<b>Mês concluído</b> — edição bloqueada.'; btn.textContent="Reabrir mês"; }
+      else{ txt.textContent="Mês aberto para edição."; btn.textContent="Marcar como concluído"; }
+    }else{
+      btn.hidden=true;
+      txt.innerHTML=fechado?'<b>✓ Escala definitiva</b> — mês fechado pelo administrador.':'<b>Em montagem</b> — o administrador ainda não fechou este mês; a escala pode mudar.';
+    }
+    pb.hidden=!(estado.papel==="colaborador"&&!estado.visao&&!fechado);
+    // ferramentas de montagem só aparecem quando há o que editar
+    document.querySelector(".p-equipes").hidden=!ed;
+    document.getElementById("toolbar").hidden=!ed;
+    document.getElementById("ferrEdicao").hidden=!ed;
+    document.querySelector(".rec-row").hidden=proposta;     // "acordo base" é da escala definitiva
+    if(proposta) document.getElementById("padraoWrap").hidden=true;
+    ["quickDias","quickBtn","acordoBtn","copiarBtn","limparBtn"].forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=!ed; });
   }
 
   function celulaExtra(d,fechado){
     const dw=diaDaSemana(estado.ano,estado.mes,d), fds=(dw===0||dw===6);
     const fnome=feriadoNome(estado.ano,estado.mes,d);
     const oc=ocupantesDoDia(d), cor=corDoDia(d);
+    const marcaDif=visaoAtiva()&&!mesmoConjunto(((estado.extra[chaveMes()]||{})[d])||[],oc);
     const btn=document.createElement("button"); btn.type="button"; btn.dataset.dia=d; btn.disabled=fechado;
-    btn.className="cellx"+(fds?" weekend":"")+(fnome?" feriado":"")+(oc.length?" tem-cor":"")+(ehHoje(estado.ano,estado.mes,d)?" hoje":"")+(estado.destaque&&oc.includes(estado.destaque)?" hl":"");
+    btn.className="cellx"+(marcaDif?" dif":"")+(fds?" weekend":"")+(fnome?" feriado":"")+(oc.length?" tem-cor":"")+(ehHoje(estado.ano,estado.mes,d)?" hoje":"")+(estado.destaque&&oc.includes(estado.destaque)?" hl":"");
     let corpo="";
     if(oc.length){
       btn.style.setProperty("--cor",cor);
@@ -826,7 +957,7 @@
   }
   function renderCalExtra(){
     const grid=document.getElementById("gridExtra"); grid.innerHTML="";
-    const nd=diasNoMes(estado.ano,estado.mes), off=diaDaSemana(estado.ano,estado.mes,1), fechado=mesFechado(estado.ano,estado.mes);
+    const nd=diasNoMes(estado.ano,estado.mes), off=diaDaSemana(estado.ano,estado.mes,1), fechado=!editavelAgora();
     grid.classList.toggle("pintando",!!estado.pincel&&!fechado);
     grid.classList.toggle("com-destaque",!!estado.destaque);
     for(let i=0;i<off;i++){ const e=document.createElement("div"); e.className="cell empty"; grid.appendChild(e); }
@@ -834,7 +965,7 @@
   }
   function atualizarCelulaExtra(d){
     const velha=document.querySelector('#gridExtra .cellx[data-dia="'+d+'"]');
-    if(velha) velha.replaceWith(celulaExtra(d,mesFechado()));
+    if(velha) velha.replaceWith(celulaExtra(d,!editavelAgora()));
   }
 
   // --- Pincel: clique em um dia ou arraste sobre vários (mouse ou toque) ---
@@ -855,7 +986,7 @@
     else if(modo==="tirar") setOcupantes(d,oc.filter(x=>x!==pc.ref));
   }
   function iniciarPintura(d){
-    if(mesFechado(estado.ano,estado.mes)) return false;
+    if(!editavelAgora()) return false;
     if(!estado.pincel){ toast("Escolha uma equipe, um perito ou a borracha ao lado."); return false; }
     const modo=modoPintura(d); if(!modo) return false;
     pintura={modo, dias:new Set([d])};
@@ -872,10 +1003,14 @@
       if(c.hasPointerCapture&&c.hasPointerCapture(ev.pointerId)) c.releasePointerCapture(ev.pointerId);
       iniciarPintura(+c.dataset.dia);
     });
-    // teclado (Enter/Espaço) gera "click" sem ponteiro; clique sem pincel só orienta
+    // Enter/Espaço em uma célula em foco gera "click": só nesse caso o clique pinta (mouse e toque já pintaram no pointerdown).
+    // Não dá para usar click.detail===0 para reconhecer o teclado: alguns aparelhos de toque também enviam detail=0.
+    let porTeclado=false;
+    grid.addEventListener("keydown",ev=>{ if(ev.key==="Enter"||ev.key===" ") porTeclado=true; });
+    grid.addEventListener("keyup",()=>{ setTimeout(()=>{ porTeclado=false; },0); });
     grid.addEventListener("click",ev=>{
       const c=ev.target.closest(".cellx[data-dia]"); if(!c) return;
-      if(ev.detail===0) cliqueDia(+c.dataset.dia);
+      if(porTeclado) cliqueDia(+c.dataset.dia);
       else if(!estado.pincel) toast("Escolha uma equipe, um perito ou a borracha ao lado.");
     });
     document.addEventListener("pointermove",ev=>{
@@ -890,16 +1025,19 @@
 
   // ---------- Ações de equipe ----------
   function criarEquipe(){
+    if(!(visaoAtiva()?estado.visao.modo==="editar":ehEditorDef())) return;
     const ids=[...document.querySelectorAll('#membroPick input:checked')].map(i=>i.value);
     if(ids.length<1){ toast("Selecione ao menos 1 perito."); return; }
     if(ids.length>3){ toast("No máximo 3 peritos por equipe."); return; }
-    if(estado.equipes.some(e=>mesmoConjunto(e.membros,ids))){ toast("Já existe uma equipe com esses peritos."); return; }
-    const rec=document.getElementById("recCheck").checked;
+    const todas=equipesEf();
+    if(todas.some(e=>mesmoConjunto(e.membros,ids))){ toast("Já existe uma equipe com esses peritos."); return; }
+    const naProposta=visaoAtiva();
+    const rec=!naProposta&&document.getElementById("recCheck").checked;
     const diasPadrao=rec?parseDias(document.getElementById("padraoInput").value,31):[];
-    const usadas=new Set(estado.equipes.map(e=>e.cor));
-    const cor=CORES_EQUIPE.find(c=>!usadas.has(c))||CORES_EQUIPE[estado.equipes.length%CORES_EQUIPE.length];
+    const usadas=new Set(todas.map(e=>e.cor));
+    const cor=CORES_EQUIPE.find(c=>!usadas.has(c))||CORES_EQUIPE[todas.length%CORES_EQUIPE.length];
     const eq={id:uid(),membros:ids,cor,recorrente:rec,diasPadrao};
-    estado.equipes.push(eq);
+    if(naProposta) estado.prop.equipes.push(eq); else estado.equipes.push(eq);
     estado.pincel={tipo:"equipe",ref:eq.id};
     document.querySelectorAll('#membroPick input:checked').forEach(i=>i.checked=false);
     document.getElementById("recCheck").checked=false;
@@ -909,7 +1047,14 @@
   }
 
   function removerEquipe(id){
-    estado.equipes=estado.equipes.filter(e=>e.id!==id);
+    if(visaoAtiva()){
+      if(estado.visao.modo!=="editar") return;
+      const i=estado.prop.equipes.findIndex(e=>e.id===id); if(i<0) return;   // equipes da definitiva não saem pela proposta
+      estado.prop.equipes.splice(i,1);
+    }else{
+      if(!ehEditorDef()) return;
+      estado.equipes=estado.equipes.filter(e=>e.id!==id);
+    }
     if(estado.pincel && estado.pincel.tipo==="equipe" && estado.pincel.ref===id) estado.pincel=null;
     // Os dias já montados são mantidos (os peritos ficam materializados no dia).
     persistir(); renderExtra();
@@ -917,7 +1062,7 @@
   }
 
   function atribuirQuick(){
-    if(mesFechado(estado.ano,estado.mes)) return;
+    if(!editavelAgora()) return;
     if(!estado.pincel){ toast("Escolha uma equipe, um perito ou a borracha primeiro."); return; }
     const nd=diasNoMes(estado.ano,estado.mes);
     const dias=parseDias(document.getElementById("quickDias").value,nd);
@@ -931,7 +1076,7 @@
   }
 
   async function aplicarAcordo(){
-    if(mesFechado(estado.ano,estado.mes)) return;
+    if(!editavelAgora()) return;
     const recs=estado.equipes.filter(e=>e.recorrente&&(e.diasPadrao||[]).length);
     if(!recs.length){ toast("Nenhuma equipe recorrente com dias-padrão."); return; }
     const nd=diasNoMes(estado.ano,estado.mes);
@@ -944,7 +1089,7 @@
   }
 
   async function copiarMesAnterior(){
-    if(mesFechado(estado.ano,estado.mes)) return;
+    if(!editavelAgora()) return;
     let m=estado.mes-1,a=estado.ano; if(m<1){ m=12; a--; }
     const src=estado.extra[chaveMes(a,m)];
     if(!src||!Object.keys(src).length){ toast("O mês anterior está vazio."); return; }
@@ -956,16 +1101,17 @@
   }
 
   async function limparMes(){
-    if(mesFechado(estado.ano,estado.mes)) return;
+    if(!editavelAgora()) return;
     const n=Object.keys(extraDoMes()).length;
     if(!n){ toast("Mês já está vazio."); return; }
     if(!await confirmar("Limpar mês",'<p>Apagar os <b>'+plural(n,"dia")+'</b> lançados na escala extraoficial de <b>'+nomeMesAno(estado.ano,estado.mes)+'</b>?</p><p class="hint">Dá para voltar atrás com <b>Desfazer</b>.</p>',"Limpar mês",true)) return;
-    delete estado.extra[chaveMes()];
+    if(visaoAtiva()) estado.prop.dias={}; else delete estado.extra[chaveMes()];
     persistir(); renderExtra();
     toast("Mês limpo.",{rotulo:"Desfazer",fn:desfazer});
   }
 
   function toggleLock(){
+    if(!ehEditorDef()||estado.visao) return;
     const k=chaveMes();
     if(estado.fechados.includes(k)) estado.fechados=estado.fechados.filter(x=>x!==k);
     else{ estado.fechados.push(k); estado.pincel=null; }
@@ -974,6 +1120,7 @@
 
   // ---------- Cadastro de perito ----------
   function cadastrar(){
+    if(!ehEditorDef()) return;
     const nomeInp=document.getElementById("nomeInput"), nome=nomeInp.value.trim().slice(0,80), sel=document.querySelector('input[name="grp"]:checked');
     if(!nome){ nomeInp.focus(); flash(nomeInp); return; }
     if(!sel){ flash(document.getElementById("grpPick")); toast("Escolha o grupo do perito."); return; }
@@ -987,24 +1134,34 @@
 
   // ---------- Exportar/Importar ----------
   function exportar(){
+    if(!ehEditorDef()) return;
     baixar(new Blob([JSON.stringify(snapshot(),null,2)],{type:"application/json"}),"escala-npf-"+isoDe(new Date())+".json");
     toast("Backup exportado.");
   }
-  function importar(file){
-    const r=new FileReader();
-    r.onload=async e=>{
-      let data;
-      try{ data=JSON.parse(e.target.result); }catch(err){ toast("Arquivo inválido."); return; }
-      const s=sanitizar(data);
-      if(!s.peritos.length&&!Object.keys(s.extra).length){ toast("O arquivo não contém dados da escala."); return; }
-      const ok=await confirmar("Importar backup",
-        '<p>O arquivo tem <b>'+plural(s.peritos.length,"perito")+'</b>, <b>'+plural(s.equipes.length,"equipe")+'</b> e escalas de <b>'+plural(Object.keys(s.extra).length,"mês","meses")+'</b>.</p><p>Os dados atuais serão <b>substituídos</b>. Dá para voltar atrás com <b>Desfazer</b>.</p>',"Importar");
-      if(!ok) return;
-      aplicarDados(Array.isArray(data)?{peritos:data,equipes:estado.equipes,extra:estado.extra,fechados:estado.fechados,feriadosExtras:estado.feriadosExtras,config:estado.config}:data);
-      persistir(); render();
-      toast("Dados importados.",{rotulo:"Desfazer",fn:desfazer});
-    };
-    r.readAsText(file);
+  // Lê um arquivo de backup (.json) e devolve os dados já validados e limpos: nada do arquivo é usado sem passar pela sanitização.
+  function lerBackup(file){
+    return new Promise((resolve,reject)=>{
+      const r=new FileReader();
+      r.onerror=()=>reject(new Error("Não foi possível ler o arquivo."));
+      r.onload=e=>{
+        let data; try{ data=JSON.parse(e.target.result); }catch(err){ reject(new Error("Arquivo inválido.")); return; }
+        if(Array.isArray(data)) data={peritos:data, equipes:estado.equipes, extra:estado.extra, fechados:estado.fechados, feriadosExtras:estado.feriadosExtras, config:estado.config};
+        const s=sanitizar(data);
+        if(!s.peritos.length&&!Object.keys(s.extra).length){ reject(new Error("O arquivo não contém dados da escala.")); return; }
+        resolve({dados:Object.assign({versao:VERSAO_DADOS},s), resumo:{peritos:s.peritos.length, equipes:s.equipes.length, meses:Object.keys(s.extra).length, fechados:s.fechados.length}});
+      };
+      r.readAsText(file);
+    });
+  }
+  async function importar(file){
+    if(!ehEditorDef()) return;
+    let res; try{ res=await lerBackup(file); }catch(err){ toast(err.message); return; }
+    const s=res.resumo;
+    const ok=await confirmar("Importar backup",
+      '<p>O arquivo tem <b>'+plural(s.peritos,"perito")+'</b>, <b>'+plural(s.equipes,"equipe")+'</b> e escalas de <b>'+plural(s.meses,"mês","meses")+'</b>.</p><p>Os dados atuais serão <b>substituídos</b>. Dá para voltar atrás com <b>Desfazer</b>.</p>',"Importar");
+    if(!ok) return;
+    aplicarDados(res.dados); persistir(); render();
+    toast("Dados importados.",{rotulo:"Desfazer",fn:desfazer});
   }
 
   // ---------- Seletores ----------
@@ -1020,12 +1177,14 @@
   function irParaHoje(){ const h=new Date(), c=clampMesAno(h.getFullYear(),h.getMonth()+1); estado.ano=c.ano; estado.mes=c.mes; render(); }
 
   // ---------- Abas ----------
+  const ABAS={oficial:["tabOficial","tabBtnOficial"], extra:["tabExtra","tabBtnExtra"], propostas:["tabPropostas","tabBtnProp"]};
+  function abasDisponiveis(){ return estado.papel==="mestre"||estado.papel==="colaborador"?["oficial","extra","propostas"]:["oficial","extra"]; }
   function setAba(aba){
+    if(!abasDisponiveis().includes(aba)) aba="oficial";
     estado.aba=aba;
-    document.getElementById("tabOficial").hidden=(aba!=="oficial");
-    document.getElementById("tabExtra").hidden=(aba!=="extra");
-    ["Oficial","Extra"].forEach(n=>{ const b=document.getElementById("tabBtn"+n), on=(n==="Oficial")===(aba==="oficial"); b.classList.toggle("active",on); b.setAttribute("aria-selected",on); });
+    Object.keys(ABAS).forEach(k=>{ const on=k===aba; document.getElementById(ABAS[k][0]).hidden=!on; const b=document.getElementById(ABAS[k][1]); b.classList.toggle("active",on); b.setAttribute("aria-selected",on); });
     salvarPrefs();
+    avisarRender();
   }
 
   // ---------- Tema ----------
@@ -1039,46 +1198,73 @@
   }
 
   // ---------- Conta / nuvem ----------
-  // O módulo nuvem.js (Firebase) atualiza Nuvem.info e registra a API de login; aqui só desenhamos.
+  // nuvem.js (Firebase) atualiza Nuvem.info e registra a API; acesso.js desenha a tela de acesso e as propostas.
   const Nuvem = {
-    info:{disponivel:false, status:"local", usuario:null, detalhe:"", salvoEm:null},
-    api:null,
-    definir(p){ Object.assign(this.info,p); renderConta(); },
-    registrar(api){ this.api=api; renderConta(); }
+    info:{
+      disponivel:NUVEM_ATIVA, status:NUVEM_ATIVA?"sincronizando":"local", usuario:null, detalhe:"", salvoEm:null,
+      acesso:{estado:NUVEM_ATIVA?"conectando":"ativo", papel:NUVEM_ATIVA?null:"local"},
+      acessos:[], acessosCarregados:false, propostas:[], propostasCarregadas:false
+    },
+    api:null, ganchos:[],
+    definir(p){ Object.assign(this.info,p); renderConta(); this.avisar(); },
+    registrar(api){ this.api=api; renderConta(); this.avisar(); },
+    aoMudar(cb){ this.ganchos.push(cb); },
+    avisar(){ this.ganchos.forEach(cb=>{ try{ cb(this.info); }catch(e){ console.error(e); } }); }
   };
-  const ROTULO_STATUS={local:"Só neste navegador", desconectado:"Só neste navegador", sincronizando:"Conectando…", salvando:"Salvando…", salvo:"Salvo na nuvem", offline:"Offline", erro:"Erro na nuvem"};
+  const ROTULO_STATUS={local:"Só neste navegador", desconectado:"Desconectado", sincronizando:"Conectando…", salvando:"Salvando…", salvo:"Salvo na nuvem", atualizado:"Atualizado", offline:"Offline", erro:"Erro na nuvem"};
   function hora(ms){ const d=new Date(ms); return _pad2(d.getHours())+":"+_pad2(d.getMinutes()); }
+  function safeParse(s){ try{ return JSON.parse(s); }catch(e){ return null; } }
+  // A foto de perfil só é exibida se vier do Google: quem pede acesso escolhe o texto do próprio perfil e não pode escolher um endereço de imagem para rastrear o administrador.
+  function fotoSegura(url){ return /^https:\/\/[a-z0-9.-]+\.googleusercontent\.com\//i.test(url||"")?url:""; }
+  function avatarHtml(u){ const f=fotoSegura(u&&u.foto); return f?'<img alt="" referrerpolicy="no-referrer" src="'+escapar(f)+'">':escapar((((u&&(u.nome||u.email))||"?")+"").charAt(0).toUpperCase()); }
+  function statusTexto(){
+    const i=Nuvem.info;
+    if(i.status==="salvo"&&i.salvoEm) return "Tudo salvo na nuvem (última gravação às "+hora(i.salvoEm)+").";
+    if(i.status==="atualizado") return "Você está vendo a escala atualizada em tempo real.";
+    return ROTULO_STATUS[i.status]||"";
+  }
   function renderConta(){
     const i=Nuvem.info, chip=document.getElementById("syncChip"), login=document.getElementById("loginBtn"), av=document.getElementById("avatarBtn");
     chip.dataset.s=i.status; chip.querySelector(".st").textContent=ROTULO_STATUS[i.status]||i.status;
-    chip.title=i.detalhe||(i.status==="salvo"&&i.salvoEm?"Salvo na sua conta às "+hora(i.salvoEm):"Onde seus dados estão salvos");
-    login.hidden=!(i.disponivel&&!i.usuario);
-    chip.hidden=i.disponivel&&!i.usuario;
+    chip.title=i.detalhe||(i.status==="salvo"&&i.salvoEm?"Salvo na nuvem às "+hora(i.salvoEm):"Onde seus dados estão salvos");
+    login.hidden=true;                       // o login é feito na tela de acesso
+    chip.hidden=NUVEM_ATIVA&&!i.usuario;
     av.hidden=!i.usuario;
     if(i.usuario){
-      av.title="Conectado como "+(i.usuario.email||i.usuario.nome);
-      av.innerHTML=i.usuario.foto?'<img alt="" referrerpolicy="no-referrer" src="'+escapar(i.usuario.foto)+'">':escapar((i.usuario.nome||i.usuario.email||"?").charAt(0).toUpperCase());
+      av.title="Conectado como "+(i.usuario.email||i.usuario.nome)+(estado.papel?" · "+(PAPEIS[estado.papel]||""):"");
+      av.innerHTML=avatarHtml(i.usuario);
       const img=av.querySelector("img"); if(img) img.addEventListener("error",()=>{ av.textContent=(i.usuario.nome||"?").charAt(0).toUpperCase(); });
     }
     renderAviso();
     if(document.getElementById("cfgDlg").open) renderCfgConta();
   }
   function renderAviso(){
-    const i=Nuvem.info, nuvem=!!i.usuario;
-    document.getElementById("avisoIcone").classList.toggle("nuvem",nuvem);
-    document.getElementById("avisoTitulo").textContent=nuvem?"Seus dados estão salvos na sua conta":"Sobre o armazenamento dos dados";
-    document.getElementById("avisoTexto").innerHTML=nuvem
-      ? 'Tudo o que você cadastra é salvo automaticamente na nuvem, vinculado à conta <b>'+escapar(i.usuario.email||"")+'</b>, e sincroniza entre computador e celular. Uma cópia fica neste navegador para abrir rápido e funcionar sem internet — as alterações feitas offline são enviadas assim que a conexão voltar. Em computador compartilhado, use <b>Sair</b> e apague a cópia local.'
-      : (i.disponivel
-        ? 'Neste momento, o que você cadastra fica salvo <b>apenas neste navegador, neste computador</b>. <b>Entre com sua conta Google</b> (botão no topo) para guardar na nuvem e acessar de qualquer computador ou celular.'
-        : 'Tudo o que você cadastra aqui — peritos, grupos, equipes, férias e as escalas montadas — fica salvo <b>apenas neste navegador, neste computador</b>. Em outro computador, outro navegador ou janela anônima você não encontrará as mesmas informações, e limpar os dados de navegação apaga tudo. Para salvar na nuvem com login do Google, veja <b>Configurações › Conta</b>.');
+    const papel=estado.papel;
+    document.getElementById("avisoIcone").classList.toggle("nuvem",NUVEM_ATIVA&&!!Nuvem.info.usuario);
+    let titulo, texto;
+    if(papel==="mestre"){
+      titulo="Você é o administrador da escala de "+UNIDADE;
+      texto='A escala definitiva fica salva na nuvem e é exibida, em tempo real, para as pessoas que você autorizou. Só você altera a escala definitiva: quem colabora envia <b>propostas</b> e você aprova na aba <b>Aprovações</b>. Uma cópia fica neste navegador para abrir rápido e funcionar sem internet — o que for alterado offline sobe quando a conexão voltar.';
+    }else if(papel==="colaborador"){
+      titulo="Escala de "+UNIDADE+" — colaborador";
+      texto='Você vê a escala definitiva publicada pelo administrador. Para sugerir mudanças ou montar a escala de um mês, use a aba <b>Propostas</b>: a escala só muda quando o administrador aprovar.';
+    }else if(papel==="leitor"){
+      titulo="Escala de "+UNIDADE+" — consulta";
+      texto='Você tem acesso somente para consultar a escala definitiva publicada pelo administrador.';
+    }else{
+      titulo="Sobre o armazenamento dos dados";
+      texto='Tudo o que você cadastra aqui — peritos, grupos, equipes, férias e as escalas montadas — fica salvo <b>apenas neste navegador, neste computador</b>. Em outro computador, outro navegador ou janela anônima você não encontrará as mesmas informações, e limpar os dados de navegação apaga tudo. Para salvar na nuvem com login do Google, veja <b>Configurações › Conta</b>.';
+    }
+    document.getElementById("avisoTitulo").textContent=titulo;
+    document.getElementById("avisoTexto").innerHTML=texto;
   }
 
   // ---------- Configurações ----------
   function abrirConfig(){
-    const dlg=document.getElementById("cfgDlg");
-    renderCfgConta(); renderCfgFeriados(); renderCfgVersoes();
-    document.getElementById("cfgHora").value=estado.config.horaInicio;
+    const dlg=document.getElementById("cfgDlg"), ed=ehEditorDef();
+    renderCfgConta(); renderCfgFeriados(); if(ed) renderCfgVersoes();
+    const h=document.getElementById("cfgHora"); h.value=estado.config.horaInicio; h.disabled=!ed;
+    document.getElementById("cfgFerAddBox").hidden=!ed;
     document.querySelectorAll("#cfgTema button").forEach(b=>b.classList.toggle("active",b.dataset.t===(prefs.tema||"auto")));
     if(!dlg.open) dlg.showModal();
   }
@@ -1086,13 +1272,10 @@
     const box=document.getElementById("cfgConta"), i=Nuvem.info;
     const titulo='<h3><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5h7.2a3 3 0 00.4-6A4.2 4.2 0 004 7.3a2.6 2.6 0 00.5 5.2z"/></svg>Conta e sincronização</h3>';
     if(i.usuario){
-      const u=i.usuario;
-      box.innerHTML=titulo+'<div class="conta-card"><span class="avatar-btn">'+(u.foto?'<img alt="" referrerpolicy="no-referrer" src="'+escapar(u.foto)+'">':escapar((u.nome||u.email||"?").charAt(0).toUpperCase()))+'</span><div class="grow"><div class="cn">'+escapar(u.nome||"")+'</div><div class="ce">'+escapar(u.email||"")+'</div></div><button class="btn-sm" id="cfgSair">Sair</button></div>'+
-        '<p class="hint">'+escapar(i.detalhe||(i.status==="salvo"&&i.salvoEm?"Tudo salvo na nuvem (última gravação às "+hora(i.salvoEm)+").":ROTULO_STATUS[i.status]||""))+'</p>';
+      const u=i.usuario, papel=estado.papel?PAPEIS[estado.papel]:"";
+      box.innerHTML=titulo+'<div class="conta-card"><span class="avatar-btn">'+avatarHtml(u)+'</span><div class="grow"><div class="cn">'+escapar(u.nome||"")+'</div><div class="ce">'+escapar(u.email||"")+(papel?' · <b>'+escapar(papel)+'</b>':'')+'</div></div><button class="btn-sm" id="cfgSair">Sair</button></div>'+
+        '<p class="hint">'+escapar(i.detalhe||statusTexto())+'</p>';
       box.querySelector("#cfgSair").addEventListener("click",sair);
-    }else if(i.disponivel){
-      box.innerHTML=titulo+'<p>Entre com sua conta Google para salvar a escala na nuvem e abrir de qualquer computador ou celular. A sessão fica guardada neste dispositivo até você sair.</p><button class="btn-google" id="cfgEntrar">'+document.getElementById("loginBtn").innerHTML+'</button>'+(i.detalhe?'<p class="hint" style="margin-top:8px">'+escapar(i.detalhe)+'</p>':'');
-      box.querySelector("#cfgEntrar").addEventListener("click",entrar);
     }else{
       const guia=CFG.guiaUrl?'<a href="'+escapar(CFG.guiaUrl)+'" target="_blank" rel="noopener">guia de configuração</a>':'guia de configuração (README do projeto)';
       box.innerHTML=titulo+'<p>A sincronização na nuvem <b>ainda não foi ativada</b> nesta instalação — os dados ficam só neste navegador.</p>'+
@@ -1100,17 +1283,18 @@
     }
   }
   function renderCfgFeriados(){
-    const box=document.getElementById("cfgFeriados"); box.innerHTML="";
+    const box=document.getElementById("cfgFeriados"), ed=ehEditorDef(); box.innerHTML="";
     if(!estado.feriadosExtras.length){ box.innerHTML='<div class="hint">Nenhum feriado personalizado.</div>'; return; }
     estado.feriadosExtras.forEach(f=>{
       const row=document.createElement("div"); row.className="item-cfg";
       const [a,m,d]=f.data.split("-").map(Number);
-      row.innerHTML='<span class="mono">'+fmtData(f.data)+'</span><span class="grow">'+escapar(f.nome)+' <small>· '+DOW_FULL[diaDaSemana(a,m,d)]+'</small></span><button class="btn-sm danger" aria-label="Remover feriado">Remover</button>';
-      row.querySelector("button").addEventListener("click",()=>{ estado.feriadosExtras=estado.feriadosExtras.filter(x=>x!==f); persistir(); render(); renderCfgFeriados(); });
+      row.innerHTML='<span class="mono">'+fmtData(f.data)+'</span><span class="grow">'+escapar(f.nome)+' <small>· '+DOW_FULL[diaDaSemana(a,m,d)]+'</small></span>'+(ed?'<button class="btn-sm danger" aria-label="Remover feriado">Remover</button>':'');
+      if(ed) row.querySelector("button").addEventListener("click",()=>{ estado.feriadosExtras=estado.feriadosExtras.filter(x=>x!==f); persistir(); render(); renderCfgFeriados(); });
       box.appendChild(row);
     });
   }
   function adicionarFeriado(){
+    if(!ehEditorDef()) return;
     const data=document.getElementById("cfgFerData").value, nomeEl=document.getElementById("cfgFerNome"), nome=nomeEl.value.trim().slice(0,60);
     if(!RE_ISO.test(data)||!nome){ toast("Informe a data e o nome do feriado."); return; }
     const [a,m,d]=data.split("-").map(Number), existente=feriadosAno(a)[_pad2(m)+"-"+_pad2(d)];
@@ -1121,8 +1305,8 @@
   function resumoVersao(json){ try{ const s=JSON.parse(json); return plural((s.peritos||[]).length,"perito")+" · "+plural(Object.keys(s.extra||{}).length,"mês","meses"); }catch(e){ return ""; } }
   async function renderCfgVersoes(){
     const box=document.getElementById("cfgVersoes"), hint=document.getElementById("cfgVersoesHint");
-    const naNuvem=!!(Nuvem.info.usuario&&Nuvem.api&&Nuvem.api.listarVersoes);
-    hint.textContent=naNuvem?"Uma cópia por dia fica guardada na sua conta por 60 dias; aqui aparecem as dos últimos 30. Restaurar substitui os dados atuais — e pode ser desfeito.":"Uma cópia por dia fica guardada neste navegador (últimos "+DIAS_HIST_LOCAL+" dias). Restaurar substitui os dados atuais — e pode ser desfeito.";
+    const naNuvem=!!(Nuvem.info.usuario&&Nuvem.api&&Nuvem.api.listarVersoes&&estado.papel==="mestre");
+    hint.textContent=naNuvem?"Uma cópia por dia fica guardada na nuvem por 60 dias; aqui aparecem as dos últimos 30. Restaurar substitui os dados atuais — e pode ser desfeito.":"Uma cópia por dia fica guardada neste navegador (últimos "+DIAS_HIST_LOCAL+" dias). Restaurar substitui os dados atuais — e pode ser desfeito.";
     box.innerHTML='<div class="hint">Carregando…</div>';
     let versoes=[];
     try{ versoes=naNuvem?await Nuvem.api.listarVersoes():HistLocal.listar(); }
@@ -1143,30 +1327,25 @@
     });
   }
 
-  async function entrar(){
-    if(!Nuvem.api){ toast("O login ainda está carregando. Tente em instantes."); return; }
-    const cfgDlg=document.getElementById("cfgDlg"); if(cfgDlg.open) cfgDlg.close();
-    await dialogo({
-      titulo:"Entrar com Google",
-      html:'<p>Ao entrar, a escala fica salva na sua conta e sincroniza entre computador e celular.</p><label class="chk"><input type="checkbox" id="lembrarChk" checked><span>Manter conectado neste dispositivo<small>Desmarque em computadores compartilhados — a sessão termina ao fechar a aba.</small></span></label>',
-      botoes:[{id:"nao",rotulo:"Cancelar"},{id:"sim",rotulo:"Continuar com Google",estilo:"solid",
-        // a janela do Google precisa abrir dentro do próprio clique, senão o navegador a bloqueia
-        aoClicar:corpo=>Nuvem.api.entrar({lembrar:corpo.querySelector("#lembrarChk").checked})}]
-    });
-  }
   async function sair(){
     if(!Nuvem.api) return;
     const cfgDlg=document.getElementById("cfgDlg"); if(cfgDlg.open) cfgDlg.close();
-    const r=await dialogo({
-      titulo:"Sair da conta",
-      html:'<p>Seus dados continuam salvos na sua conta Google. O que fazer com a cópia deste navegador?</p>',
-      botoes:[{id:"apagar",rotulo:"Sair e apagar os dados deste navegador",estilo:"solid"},{id:"manter",rotulo:"Sair e manter uma cópia aqui"},{id:null,rotulo:"Cancelar"}],
-      coluna:true
-    });
-    if(!r) return;
-    await Nuvem.api.sair();
-    if(r==="apagar") limparLocal();
-    toast(r==="apagar"?"Você saiu. Os dados deste navegador foram apagados.":"Você saiu. Uma cópia continua neste navegador.");
+    if(estado.papel==="mestre"){
+      const r=await dialogo({
+        titulo:"Sair da conta",
+        html:'<p>A escala definitiva continua salva na nuvem. O que fazer com a cópia deste navegador?</p>',
+        botoes:[{id:"apagar",rotulo:"Sair e apagar os dados deste navegador",estilo:"solid"},{id:"manter",rotulo:"Sair e manter uma cópia aqui"},{id:null,rotulo:"Cancelar"}],
+        coluna:true
+      });
+      if(!r) return;
+      await Nuvem.api.sair();
+      if(r==="apagar") limparLocal();
+      toast(r==="apagar"?"Você saiu. Os dados deste navegador foram apagados.":"Você saiu. Uma cópia continua neste navegador.");
+    }else{
+      if(!await confirmar("Sair da conta",'<p>Você sai da escala de <b>'+escapar(UNIDADE)+'</b> neste aparelho e os dados guardados aqui são apagados. Para voltar, entre de novo com sua conta Google.</p>',"Sair")) return;
+      await Nuvem.api.sair();
+      toast("Você saiu.");
+    }
   }
   function limparLocal(){
     [CHAVE,CHAVE_HIST,CHAVE_SYNC].forEach(removerChave);
@@ -1174,7 +1353,7 @@
     hist.atual=JSON.stringify(snapshot()); hist.desfazer=[]; hist.refazer=[];
     render();
   }
-  // Aplica dados que chegaram da nuvem (outro dispositivo) — entra no histórico de desfazer.
+  // Aplica dados que chegaram da nuvem (outro dispositivo) — entra no histórico de desfazer. Só para quem edita a definitiva.
   function aplicarRemoto(json){
     const novo=canonico(json); if(!novo||novo===hist.atual) return false;
     hist.desfazer.push(hist.atual); if(hist.desfazer.length>MAX_DESFAZER) hist.desfazer.shift(); hist.refazer=[];
@@ -1182,7 +1361,114 @@
     gravar("nuvem"); render();
     return true;
   }
-  function restaurarJSON(json){ aplicarDados(JSON.parse(json)); persistir(); render(); }
+  function restaurarJSON(json){ if(!ehEditorDef()) return; aplicarDados(JSON.parse(json)); persistir(); render(); }
+
+  // ---------- Modo de uso (papel) ----------
+  let cacheUid=null;
+  const sessao={ ler:()=>lerJSON(CHAVE_SESSAO), gravar:v=>gravarJSON(CHAVE_SESSAO,v), limpar:()=>removerChave(CHAVE_SESSAO) };
+  // Entra no app com um papel. 'local'/'mestre' trabalham na cópia deste navegador; quem só visualiza abre a cópia (cache) da escala definitiva.
+  async function entrarModo(papel,opts){
+    opts=opts||{};
+    estado.papel=papel; estado.visao=null; estado.prop=null; estado.pincel=null; estado.feriasAberta=null; estado.busca="";
+    histProp.atual=""; histProp.desfazer=[]; histProp.refazer=[];
+    cacheUid=opts.uid||null;
+    if(papel==="local"||papel==="mestre"){
+      const s=await Store.load();
+      aplicarDados(s||{});
+      hist.atual=JSON.stringify(snapshot()); hist.desfazer=[]; hist.refazer=[];
+      if(s&&JSON.stringify(s)!==hist.atual) Store.save(hist.atual); // grava já no formato novo (migração)
+    }else{
+      const c=lerJSON(CHAVE_CACHE);
+      aplicarDados(c&&c.uid===cacheUid&&typeof c.json==="string"?(safeParse(c.json)||{}):{});
+      hist.atual=JSON.stringify(snapshot()); hist.desfazer=[]; hist.refazer=[];
+    }
+    estado.destaque=prefs.destaque&&peritoPorId(prefs.destaque)?prefs.destaque:null;
+    document.body.dataset.papel=papel; document.body.dataset.editor=ehEditorDef()?"1":"0";
+    const tp=document.getElementById("tabBtnProp"); tp.hidden=!(papel==="mestre"||papel==="colaborador");
+    tp.querySelector(".t-nome").textContent=papel==="mestre"?"Aprovações":"Propostas";
+    setAba(prefs.aba||"oficial");
+    render();
+  }
+  function sairModo(opts){
+    opts=opts||{};
+    if(opts.apagarCache) removerChave(CHAVE_CACHE);
+    estado.papel=null; estado.visao=null; estado.prop=null; estado.pincel=null; estado.destaque=null; estado.feriasAberta=null;
+    aplicarDados({}); hist.atual=JSON.stringify(snapshot()); hist.desfazer=[]; hist.refazer=[];
+    histProp.atual=""; histProp.desfazer=[]; histProp.refazer=[];
+    document.body.dataset.papel=""; document.body.dataset.editor="0";
+    render();
+  }
+  // Escala definitiva que chegou da nuvem para quem só visualiza (colaborador/leitor).
+  function aplicarDefinitiva(json){
+    if(ehEditorDef()) return;
+    if(json){ aplicarDados(safeParse(json)||{}); gravarJSON(CHAVE_CACHE,{uid:cacheUid,json,em:Date.now()}); }
+    else aplicarDados({});
+    if(estado.prop) saneaProposta(estado.prop);
+    if(!estado.destaque&&prefs.destaque&&peritoPorId(prefs.destaque)) estado.destaque=prefs.destaque;
+    hist.atual=JSON.stringify(snapshot());
+    render();
+  }
+  function substituirDados(dados){ if(!ehEditorDef()) return; aplicarDados(dados); persistir(); render(); }
+  function limparDados(){ if(!ehEditorDef()) return; aplicarDados({}); persistir(); render(); }
+
+  // ---------- Propostas (abrir, revisar, aplicar) ----------
+  function abrirProposta(doc,modo){
+    const m=/^(\d{4})-(\d{1,2})$/.exec((doc&&doc.mes)||""); if(!m) return;
+    const dd=dadosDeProposta(doc);
+    estado.prop={id:doc.id, mes:doc.mes, dias:dd.dias, equipes:dd.equipes, observacao:String(doc.observacao||""), status:doc.status,
+      autorNome:doc.autorNome||"", autorEmail:doc.autorEmail||"", motivo:doc.motivo||"", enviadoEm:doc.enviadoEm||null};
+    estado.visao={modo};
+    const c=clampMesAno(+m[1],+m[2]); estado.ano=c.ano; estado.mes=c.mes;
+    estado.pincel=null;
+    histProp.atual=snapshotProp(); histProp.desfazer=[]; histProp.refazer=[];
+    setAba("extra"); render();
+  }
+  function sairProposta(){
+    if(!estado.visao) return;
+    estado.visao=null; estado.prop=null; estado.pincel=null;
+    histProp.atual=""; histProp.desfazer=[]; histProp.refazer=[];
+    render();
+  }
+  function definirObservacao(t){
+    if(!estado.prop||!estado.visao||estado.visao.modo!=="editar") return;
+    estado.prop.observacao=String(t||"").slice(0,2000); persistirProposta();
+  }
+  // A proposta aberta mudou na nuvem (aprovada, rejeitada, retirada, editada em outro aparelho…).
+  function atualizarPropostaAberta(doc){
+    const p=estado.prop; if(!p||!estado.visao||p.id!==doc.id) return;
+    if(estado.papel==="mestre"&&estado.visao.modo==="revisar"&&doc.status!=="enviada"){
+      toast("Esta proposta mudou de situação ("+(STATUS_PROPOSTA[doc.status]||doc.status).toLowerCase()+"). A revisão foi encerrada.");
+      sairProposta(); return;
+    }
+    const mudouStatus=p.status!==doc.status;
+    p.status=doc.status; p.motivo=doc.motivo||""; p.enviadoEm=doc.enviadoEm||null;
+    let precisa=mudouStatus||estado.visao.modo!=="editar";
+    if(estado.visao.modo!=="editar"){ const dd=dadosDeProposta(doc); p.dias=dd.dias; p.equipes=dd.equipes; p.observacao=String(doc.observacao||""); }
+    if(estado.papel==="colaborador"){
+      const modo=doc.status==="rascunho"?"editar":"ver";
+      if(modo!==estado.visao.modo){ estado.visao.modo=modo; estado.pincel=null; precisa=true; }
+    }
+    if(precisa) render();
+  }
+  // Administrador aprova: o mês da proposta vira a escala definitiva (e, se pedido, fica fechado).
+  function aplicarPropostaNaDefinitiva(doc,fechar){
+    if(!ehEditorDef()) return false;
+    estado.visao=null; estado.prop=null; estado.pincel=null;     // sai da revisão: a partir daqui o que muda é a definitiva
+    histProp.atual=""; histProp.desfazer=[]; histProp.refazer=[];
+    const dd=dadosDeProposta(doc), k=doc.mes, m=/^(\d{4})-(\d{1,2})$/.exec(k);
+    Object.keys(dd.dias).forEach(ds=>{                              // equipes novas da proposta que foram usadas entram na lista da definitiva
+      const oc=dd.dias[ds];
+      if(estado.equipes.some(e=>mesmoConjunto(e.membros,oc))) return;
+      const loc=dd.equipes.find(e=>mesmoConjunto(e.membros,oc)); if(!loc) return;
+      const cor=CORES_EQUIPE.find(c=>!estado.equipes.some(e=>e.cor===c))||loc.cor;
+      estado.equipes.push({id:uid(),membros:loc.membros.slice(),cor,recorrente:false,diasPadrao:[]});
+    });
+    if(Object.keys(dd.dias).length) estado.extra[k]=dd.dias; else delete estado.extra[k];
+    if(fechar&&!estado.fechados.includes(k)) estado.fechados.push(k);
+    if(m){ const c=clampMesAno(+m[1],+m[2]); estado.ano=c.ano; estado.mes=c.mes; }
+    persistir(); render();
+    return true;
+  }
 
   // ---------- Eventos ----------
   function ligarEventos(){
@@ -1202,9 +1488,8 @@
     document.getElementById("impBtn").addEventListener("click",abrirImport);
     document.getElementById("impFile").addEventListener("change",e=>{ if(e.target.files[0]) importar(e.target.files[0]); e.target.value=""; });
 
-    document.getElementById("tabBtnOficial").addEventListener("click",()=>setAba("oficial"));
-    document.getElementById("tabBtnExtra").addEventListener("click",()=>setAba("extra"));
-    document.querySelector(".tabs").addEventListener("keydown",e=>{ if(e.key==="ArrowRight"||e.key==="ArrowLeft"){ const nova=estado.aba==="oficial"?"extra":"oficial"; setAba(nova); document.getElementById(nova==="oficial"?"tabBtnOficial":"tabBtnExtra").focus(); } });
+    Object.keys(ABAS).forEach(k=>document.getElementById(ABAS[k][1]).addEventListener("click",()=>setAba(k)));
+    document.querySelector(".tabs").addEventListener("keydown",e=>{ if(e.key==="ArrowRight"||e.key==="ArrowLeft"){ const l=abasDisponiveis(), i=l.indexOf(estado.aba), nova=l[(i+(e.key==="ArrowRight"?1:l.length-1))%l.length]; setAba(nova); document.getElementById(ABAS[nova][1]).focus(); } });
     document.getElementById("vtogOficial").addEventListener("click",e=>{ const b=e.target.closest(".vt-btn"); if(b) setView("oficial",b.dataset.v); });
     document.getElementById("vtogExtra").addEventListener("click",e=>{ const b=e.target.closest(".vt-btn"); if(b) setView("extra",b.dataset.v); });
     document.getElementById("printOficial").addEventListener("click",()=>imprimir("oficial"));
@@ -1232,13 +1517,12 @@
     document.getElementById("cfgBtn").addEventListener("click",abrirConfig);
     document.getElementById("syncChip").addEventListener("click",abrirConfig);
     document.getElementById("avatarBtn").addEventListener("click",abrirConfig);
-    document.getElementById("loginBtn").addEventListener("click",entrar);
 
     // configurações
     const cfgDlg=document.getElementById("cfgDlg");
     document.getElementById("cfgFechar").addEventListener("click",()=>cfgDlg.close());
     cfgDlg.addEventListener("click",e=>{ if(e.target===cfgDlg) cfgDlg.close(); });
-    document.getElementById("cfgHora").addEventListener("change",e=>{ if(RE_HORA.test(e.target.value)){ estado.config.horaInicio=e.target.value; persistir(); } });
+    document.getElementById("cfgHora").addEventListener("change",e=>{ if(ehEditorDef()&&RE_HORA.test(e.target.value)){ estado.config.horaInicio=e.target.value; persistir(); } });
     document.getElementById("cfgFerAdd").addEventListener("click",adicionarFeriado);
     document.getElementById("cfgFerNome").addEventListener("keydown",e=>{ if(e.key==="Enter") adicionarFeriado(); });
     document.getElementById("cfgExp").addEventListener("click",exportar);
@@ -1260,7 +1544,7 @@
 
     // mesma escala aberta em outra aba deste navegador
     window.addEventListener("storage",e=>{
-      if(e.key!==CHAVE||!e.newValue||e.newValue===hist.atual) return;
+      if(e.key!==CHAVE||!e.newValue||e.newValue===hist.atual||!ehEditorDef()||estado.visao) return;
       try{ aplicarDados(JSON.parse(e.newValue)); hist.atual=JSON.stringify(snapshot()); render(); }catch(err){}
     });
   }
@@ -1275,29 +1559,28 @@
     estado.viewOficial=prefs.viewOficial||(estreito?"lista":"grade");
     estado.viewExtra=prefs.viewExtra||"grade";
     aplicarTema(prefs.tema||"auto");
+    document.getElementById("subUnidade").textContent=UNIDADE+" · rodízio contínuo de 4 grupos · 24h de plantão, 72h de folga";
+    document.title="Escala de Plantões — "+UNIDADE;
     ligarEventos();
-    const s=await Store.load();
-    if(s) aplicarDados(s);
-    hist.atual=JSON.stringify(snapshot());
-    if(s&&JSON.stringify(s)!==hist.atual) Store.save(hist.atual); // grava já no formato novo (migração)
-    setAba(prefs.aba==="extra"?"extra":"oficial");
-    render();
+    if(!NUVEM_ATIVA){      // sem Firebase configurado: uso local, como na versão anterior
+      if(CFG.firebase&&CFG.firebase.apiKey) Nuvem.info.detalhe="O login com Google só funciona com o app publicado (endereço https), não abrindo o arquivo direto do computador.";
+      await entrarModo("local");
+    }
     renderConta();
     marcarPronto();
   }
 
-  // API usada pelo módulo da nuvem (nuvem.js)
+  // API usada pelos outros módulos (nuvem.js e acesso.js)
   window.EscalaApp = {
-    pronto,
-    obterJSON:()=>hist.atual,
-    canonico,
-    temDados,
-    aplicarRemoto,
-    aoMudar:cb=>ouvintes.push(cb),
-    sync:SyncMeta,
-    nuvem:Nuvem,
-    toast,
-    dialogo
+    pronto, nuvemAtiva:NUVEM_ATIVA, unidade:UNIDADE, estado,
+    obterJSON:()=>hist.atual, canonico, temDados, aplicarRemoto,
+    aoMudar:cb=>ouvintes.push(cb), aoMudarProposta:cb=>ouvintesProposta.push(cb), aoRenderizar:cb=>ganchosRender.push(cb),
+    sync:SyncMeta, nuvem:Nuvem, sessao, toast, dialogo, confirmar,
+    entrarModo, sairModo, aplicarDefinitiva, lerBackup, substituirDados, limparDados,
+    abrirProposta, sairProposta, definirObservacao, atualizarPropostaAberta, aplicarPropostaNaDefinitiva, resumoProposta, dadosDeProposta, diasDiferentes,
+    setAba, render, visaoAtiva, editavelAgora, mesFechado:k=>estado.fechados.includes(k),
+    util:{escapar, plural, nomeMesAno, compactaDias, fmtData, hora, fotoSegura, avatarHtml, MESES, DOW_FULL, LIM_INF, LIM_SUP, diasNoMes,
+      mesmoConjunto, peritoPorId, clampMesAno, antesDe, primeiroNome, ordenarPeritos, uid, STATUS_PROPOSTA, PAPEIS, UNIDADE}
   };
 
   init();

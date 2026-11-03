@@ -1,40 +1,166 @@
 rules_version = '2';
 
-// Regras de segurança do Cloud Firestore para a Escala de Plantões.
-// Copie este conteúdo em: Console do Firebase › Firestore Database › Regras › Publicar.
+// Regras de segurança do Cloud Firestore — Escala de Plantões de Itaberaba (v2.1).
+// Copie este arquivo em: Console do Firebase › Firestore Database › Regras › Publicar.
 //
-// Cada pessoa só lê e grava a PRÓPRIA escala (escalas/{seu uid}), e só se o e-mail estiver na lista abaixo.
+// Quem pode o quê:
+//   • ADMINISTRADOR (victorchaves.pc@gmail.com): grava a escala definitiva, autoriza pessoas, aprova propostas.
+//   • COLABORADOR (autorizado pelo administrador): vê tudo de Itaberaba e cria PROPOSTAS (só as suas).
+//   • LEITOR (autorizado pelo administrador): só vê.
+//   • Qualquer outra conta Google: só pode PEDIR acesso — não lê nem grava nada da escala.
+//
+// Se um dia o administrador mudar, troque o e-mail em ehMestre() e publique de novo.
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // >>> TROQUE pelo(s) e-mail(s) Google autorizados, em letras minúsculas, separados por vírgula. <<<
+    // ---------- Identidade ----------
+    function logado() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    function meuEmail() {
+      return request.auth.token.email.lower();
+    }
+    function ehMestre() {
+      return logado() && meuEmail() == 'victorchaves.pc@gmail.com';
+    }
+
+    // ---------- Autorização dada pelo administrador ----------
+    function caminhoAcesso() {
+      return /databases/$(database)/documents/unidades/itaberaba/acessos/$(meuEmail());
+    }
     function autorizado() {
-      return request.auth != null
-        && request.auth.token.email_verified == true
-        && request.auth.token.email.lower() in ['seu-email@gmail.com'];
+      return logado() && exists(caminhoAcesso())
+        && get(caminhoAcesso()).data.status == 'autorizado';
+    }
+    function colaborador() {
+      return autorizado() && get(caminhoAcesso()).data.get('papel', 'leitor') == 'colaborador';
+    }
+    function podeVer() {
+      return ehMestre() || autorizado();
     }
 
-    function dono(uid) {
-      return autorizado() && request.auth.uid == uid;
+    // ---------- Validações ----------
+    function textoOk(v, max) {
+      return v is string && v.size() <= max;
+    }
+    function jsonOk(v) {
+      return v is string && v.size() < 900000;
     }
 
-    function jsonValido() {
-      return request.resource.data.json is string
-        && request.resource.data.json.size() < 900000;
-    }
+    // ================= Itaberaba =================
+    match /unidades/itaberaba {
 
-    match /escalas/{uid} {
-      allow read, delete: if dono(uid);
-      allow create, update: if dono(uid) && jsonValido()
-        && request.resource.data.keys().hasOnly(['json', 'rev', 'versao', 'atualizadoEm', 'dispositivo', 'email'])
-        && request.resource.data.rev is int;
+      // Escala definitiva (peritos, equipes, meses, feriados, configurações): todos os autorizados leem,
+      // somente o administrador grava.
+      allow read: if podeVer();
+      allow create, update: if ehMestre()
+        && request.resource.data.keys().hasOnly(['json', 'rev', 'versao', 'atualizadoEm', 'atualizadoPor', 'dispositivo'])
+        && jsonOk(request.resource.data.json)
+        && request.resource.data.rev is int
+        && request.resource.data.atualizadoEm == request.time;
+      allow delete: if false;
 
-      // versões diárias e cópias de segurança
+      // Versões diárias e cópias de segurança — só o administrador.
       match /historico/{versao} {
-        allow read, delete: if dono(uid);
-        allow create, update: if dono(uid) && jsonValido()
-          && request.resource.data.keys().hasOnly(['json', 'rev', 'salvoEm', 'rotulo']);
+        allow read, delete: if ehMestre();
+        allow create, update: if ehMestre()
+          && request.resource.data.keys().hasOnly(['json', 'rev', 'salvoEm', 'rotulo'])
+          && jsonOk(request.resource.data.json);
       }
+
+      // Pedidos e autorizações de acesso. O documento tem o e-mail (minúsculo) como nome.
+      match /acessos/{id} {
+        allow read: if ehMestre() || (logado() && id == meuEmail());
+
+        // Qualquer conta conectada pode PEDIR acesso, apenas para o próprio e-mail e sempre como "pendente".
+        allow create: if logado() && !ehMestre() && id == meuEmail()
+          && request.resource.data.keys().hasOnly(['email', 'nome', 'foto', 'status', 'solicitadoEm', 'uid'])
+          && request.resource.data.email == meuEmail()
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.status == 'pendente'
+          && textoOk(request.resource.data.nome, 120)
+          && textoOk(request.resource.data.foto, 500)
+          && request.resource.data.solicitadoEm == request.time;
+
+        // Só o administrador autoriza, muda o papel, nega ou remove.
+        allow create, update: if ehMestre()
+          && request.resource.data.keys().hasOnly(['email', 'nome', 'foto', 'status', 'papel', 'solicitadoEm', 'uid', 'decididoEm', 'decididoPor'])
+          && request.resource.data.email == id
+          && request.resource.data.status in ['pendente', 'autorizado', 'negado']
+          && request.resource.data.get('papel', 'colaborador') in ['leitor', 'colaborador'];
+        allow delete: if ehMestre();
+      }
+
+      // Propostas de escala do mês (rascunho → enviada → aprovada/rejeitada).
+      match /propostas/{pid} {
+        function minha() {
+          return resource.data.autorUid == request.auth.uid;
+        }
+        function conteudoOk() {
+          return request.resource.data.mes is string
+            && request.resource.data.mes.matches('^20[0-9]{2}-([1-9]|1[0-2])$')
+            && jsonOk(request.resource.data.dias) && request.resource.data.dias.size() < 20000
+            && request.resource.data.equipes is string && request.resource.data.equipes.size() < 20000
+            && textoOk(request.resource.data.get('observacao', ''), 2000)
+            && textoOk(request.resource.data.get('autorNome', ''), 120);
+        }
+
+        // O autor vê a sua; o administrador vê todas.
+        allow read: if ehMestre() || (colaborador() && minha());
+
+        // Colaborador cria sempre como rascunho, em nome dele.
+        allow create: if colaborador() && conteudoOk()
+          && request.resource.data.keys().hasOnly(['mes', 'autorUid', 'autorEmail', 'autorNome', 'status', 'dias', 'equipes', 'observacao', 'criadoEm', 'atualizadoEm', 'dispositivo'])
+          && request.resource.data.autorUid == request.auth.uid
+          && request.resource.data.autorEmail == meuEmail()
+          && request.resource.data.status == 'rascunho'
+          && request.resource.data.criadoEm == request.time
+          && request.resource.data.atualizadoEm == request.time;
+
+        // Autor: edita o rascunho, envia para aprovação, retira a enviada ou reabre a rejeitada.
+        // Nunca aprova nem rejeita a própria proposta.
+        allow update: if colaborador() && minha() && conteudoOk()
+          && request.resource.data.keys().hasOnly(['mes', 'autorUid', 'autorEmail', 'autorNome', 'status', 'dias', 'equipes', 'observacao', 'criadoEm', 'atualizadoEm', 'enviadoEm', 'decididoEm', 'decididoPor', 'motivo', 'dispositivo'])
+          && request.resource.data.autorUid == resource.data.autorUid
+          && request.resource.data.autorEmail == resource.data.autorEmail
+          && request.resource.data.mes == resource.data.mes
+          && request.resource.data.criadoEm == resource.data.criadoEm
+          && request.resource.data.atualizadoEm == request.time
+          && request.resource.data.get('decididoEm', null) == resource.data.get('decididoEm', null)
+          && request.resource.data.get('decididoPor', null) == resource.data.get('decididoPor', null)
+          && request.resource.data.get('motivo', null) == resource.data.get('motivo', null)
+          && (
+            (resource.data.status == 'rascunho' && request.resource.data.status == 'rascunho')
+            || (resource.data.status == 'rascunho' && request.resource.data.status == 'enviada'
+                && request.resource.data.enviadoEm == request.time)
+            || ((resource.data.status == 'enviada' || resource.data.status == 'rejeitada')
+                && request.resource.data.status == 'rascunho'
+                && request.resource.data.dias == resource.data.dias
+                && request.resource.data.equipes == resource.data.equipes
+                && request.resource.data.get('observacao', '') == resource.data.get('observacao', ''))
+          );
+
+        // Administrador: só decide proposta ENVIADA e não mexe no conteúdo.
+        allow update: if ehMestre()
+          && request.resource.data.keys().hasOnly(['mes', 'autorUid', 'autorEmail', 'autorNome', 'status', 'dias', 'equipes', 'observacao', 'criadoEm', 'atualizadoEm', 'enviadoEm', 'decididoEm', 'decididoPor', 'motivo', 'dispositivo'])
+          && resource.data.status == 'enviada'
+          && request.resource.data.status in ['aprovada', 'rejeitada']
+          && request.resource.data.dias == resource.data.dias
+          && request.resource.data.equipes == resource.data.equipes
+          && request.resource.data.autorUid == resource.data.autorUid
+          && request.resource.data.mes == resource.data.mes
+          && request.resource.data.decididoPor == meuEmail()
+          && request.resource.data.decididoEm == request.time
+          && textoOk(request.resource.data.get('motivo', ''), 1000);
+
+        allow delete: if ehMestre()
+          || (colaborador() && minha() && resource.data.status in ['rascunho', 'rejeitada']);
+      }
+    }
+
+    // Dados da versão 2 (uma escala por usuário): o administrador só LÊ, para migrar para Itaberaba.
+    match /escalas/{uid} {
+      allow read: if ehMestre() && request.auth.uid == uid;
     }
 
     // Qualquer outro caminho fica fechado.

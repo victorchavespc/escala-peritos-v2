@@ -1,0 +1,5 @@
+# Backups e dados reais da escala NÃO vão para o repositório (ele é público).
+escala-npf*.json
+*historico*.json
+dados-privados/
+*.ics
