@@ -459,7 +459,7 @@
   .btn-print:disabled{opacity:.4;cursor:default}
 
   /* ---------- Diálogos ---------- */
-  dialog.dlg{border:1px solid var(--linha);border-radius:14px;padding:0;background:var(--superficie);color:var(--tinta);box-shadow:var(--sombra-dlg);width:min(440px, calc(100vw - 32px));max-height:calc(100vh - 48px)}
+  dialog.dlg{border:1px solid var(--linha);border-radius:14px;padding:0;background:var(--superficie);color:var(--tinta);box-shadow:var(--sombra-dlg);width:min(440px, calc(100vw - 32px));max-height:calc(100vh - 48px);max-height:calc(100dvh - 32px);overscroll-behavior:contain}
   dialog.dlg.dlg-lg{width:min(640px, calc(100vw - 32px))}
   dialog.dlg::backdrop{background:rgba(10,16,26,.5);backdrop-filter:blur(2px)}
   dialog.dlg[open]{animation:dlgIn .16s ease-out}
@@ -488,7 +488,7 @@
   .conta-card{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--sup-3);border:1px solid var(--linha);border-radius:var(--raio-sm);margin-bottom:10px}
   .conta-card .avatar-btn{cursor:default;width:40px;height:40px}
   .conta-card .cn{font-weight:600;color:var(--tinta);font-size:14px}
-  .conta-card .ce{font-size:12.5px;color:var(--tinta-3)}
+  .conta-card .ce{font-size:12.5px;color:var(--tinta-3);overflow-wrap:break-word}
   .conta-card .grow{flex:1;min-width:0}
   .lista-cfg{display:flex;flex-direction:column;gap:5px;margin-bottom:10px;max-height:240px;overflow:auto}
   .item-cfg{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--linha);border-radius:6px;background:var(--superficie);font-size:13px}
@@ -668,3 +668,12 @@
   select.txt{width:100%;border:1px solid var(--linha-forte);background:var(--campo);color:var(--tinta);font-family:inherit;font-size:14.5px;padding:9px 12px;border-radius:var(--raio-sm)}
   select.txt:focus,textarea.txt:focus{outline:none;border-color:var(--marinho-2);box-shadow:0 0 0 3px var(--foco)}
   textarea.txt{width:100%;border:1px solid var(--linha-forte);background:var(--campo);color:var(--tinta);font-size:14px;padding:9px 12px;border-radius:var(--raio-sm)}
+
+  /* v2.1.1 — ajustes do celular */
+  .tab::first-letter{text-transform:uppercase}                 /* "oficial" → "Oficial" quando a palavra "Escala" some */
+  @media (max-width:560px){
+    dialog.dlg,dialog.dlg.dlg-lg{width:calc(100vw - 16px);max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px)}
+    .conta-card{flex-wrap:wrap}
+    .conta-card .grow{flex:1 1 calc(100% - 56px)}          /* o texto usa a linha toda… */
+    .conta-card #cfgSair{margin-left:52px}                 /* …e o botão "Sair" desce, alinhado ao texto */
+  }
