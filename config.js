@@ -6,7 +6,7 @@
 window.ESCALA_CONFIG = {
   // Cole aqui o objeto "firebaseConfig" do console do Firebase.
   // Enquanto estiver null, o app funciona normalmente, mas salva só no navegador (sem login, sem compartilhamento).
-  firebase: null,
+  firebase: { apiKey: "AIzaSyBnW4wVQCrbsDkCBUpsGFrjDGNFSlw4vnI", authDomain: "escala-npf.firebaseapp.com", projectId: "escala-npf", storageBucket: "escala-npf.firebasestorage.app", messagingSenderId: "97876255500", appId: "1:97876255500:web:fefb68f2721330f30edf29" },
   /* Exemplo de como fica depois de preenchido:
   firebase: {
     apiKey: "AIza...",
