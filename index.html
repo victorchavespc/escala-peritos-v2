@@ -3,11 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Escala de Plantões — Itaberaba</title>
-<meta name="description" content="Escala de plantões dos peritos de Itaberaba: rodízio oficial A·B·C·D e escala extraoficial.">
+<title>Acesso restrito</title>
+<meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="strict-origin-when-cross-origin">
+<meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; form-action 'none'">
+<script>
+  // Não deixa outro site exibir este app dentro de um quadro (clickjacking): se estiver emoldurado, some.
+  if(window.top!==window.self) document.documentElement.style.display="none";
+</script>
 <meta name="theme-color" content="#152238">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23152238'/%3E%3Cg fill='none' stroke='%23CADEF5' stroke-width='6' stroke-linecap='round'%3E%3Cpath d='M50 22c-13 0-23 10-23 23 0 8 2 15 5 22'/%3E%3Cpath d='M50 34c-6 0-11 5-11 11 0 9 2 17 6 25'/%3E%3Cpath d='M50 34c6 0 11 5 11 11 0 7-1 13-3 19'/%3E%3Cpath d='M50 22c13 0 23 10 23 23 0 5-1 9-2 13'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%23152238'/%3E%3Cg fill='none' stroke='%23CADEF5' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='27' y='46' width='46' height='32' rx='8'/%3E%3Cpath d='M37 46V37a13 13 0 0126 0v9'/%3E%3C/g%3E%3C/svg%3E">
 <script>
   // Aplica o tema salvo antes de desenhar a página (evita "piscar" claro → escuro).
   try{ var t=(JSON.parse(localStorage.getItem("escala_npf_prefs"))||{}).tema; if(t==="claro") document.documentElement.dataset.theme="light"; else if(t==="escuro") document.documentElement.dataset.theme="dark"; }catch(e){}
@@ -23,15 +28,19 @@
 </script>
 </head>
 <body>
+<noscript>
+  <style>body>header,.tabbar,main,.rodape,.gate{display:none!important}</style>
+  <p style="padding:32px 20px;font:16px/1.5 system-ui,sans-serif;color:#586271">Este endereço precisa de JavaScript para funcionar.</p>
+</noscript>
 
 <!-- Tela de acesso: login com Google, pedido de acesso e primeiro acesso do administrador (conteúdo desenhado por assets/acesso.js) -->
 <div class="gate" id="gate" role="dialog" aria-modal="true" aria-labelledby="gateTitulo">
   <div class="gate-card">
     <div class="gate-marca">
       <div class="emblem" aria-hidden="true">
-        <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round"><path d="M50 14C33 14 19 28 19 45c0 7 1 13 3 19"/><path d="M50 22c-13 0-23 10-23 23 0 8 2 15 5 22"/><path d="M50 30c-8 0-15 7-15 15 0 9 2 17 6 25"/><path d="M50 38c-4 0-7 3-7 7 0 10 2 20 7 29"/><path d="M50 38c4 0 7 3 7 7 0 8-1 15-4 22"/><path d="M50 30c8 0 15 7 15 15 0 7-1 13-3 19"/><path d="M50 22c13 0 23 10 23 23 0 5-1 9-2 13"/><path d="M50 14c17 0 31 14 31 31 0 3 0 5-1 8"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/></svg>
       </div>
-      <div><div class="gate-nome">Escala de Plantões</div><div class="gate-un" id="gateUnidade">Itaberaba</div></div>
+      <div class="gate-nome">Acesso restrito</div>
     </div>
     <div id="gateCorpo"></div>
   </div>
@@ -66,7 +75,7 @@
       </div>
       <div>
         <h1>Escala de Plantões</h1>
-        <p class="sub" id="subUnidade">Itaberaba · rodízio contínuo de 4 grupos · 24h de plantão, 72h de folga</p>
+        <p class="sub" id="subUnidade"></p>
       </div>
     </div>
     <div class="monthnav" role="group" aria-label="Selecionar mês e ano">
@@ -288,7 +297,7 @@
     Os grupos seguem um <span class="mono">rodízio contínuo A · B · C · D</span>, dia após dia, sem reiniciar a cada mês.
     Na extraoficial, o nº de plantões de um perito é a contagem de dias em que ele está escalado, comparado com a cota oficial do mês (descontados férias e afastamentos).
     Clique e arraste sobre os dias para pintar vários de uma vez.
-    <br><span class="mono">v2.1.1</span>
+    <br><span class="mono">v2.1.2</span>
   </p>
 </footer>
 

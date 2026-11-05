@@ -20,12 +20,14 @@
   const DIAS_HIST_LOCAL = 14;
   const CORES_EQUIPE = ["#C2410C","#0E7490","#7E22CE","#15803D","#B91C1C","#0369A1","#A16207","#BE185D","#4D7C0F","#5B21B6"];
   const GRUPO_COR = {A:"#1F6E8C", B:"#A85532", C:"#4E7A3E", D:"#6E5896"};
-  const TIPOS_AFAST = {ferias:"Férias", licenca:"Licença", atestado:"Atestado médico", curso:"Curso / capacitação", outro:"Outro afastamento"};
+  const TIPOS_AFAST = {ferias:"Férias", licenca:"Licença", curso:"Curso / capacitação", outro:"Afastamento (outro motivo)"}; // sem "atestado médico": o motivo de saúde não deve circular para todos
   const FUSO_BAHIA_H = 3;                    // America/Bahia = UTC−3, sem horário de verão (usado na agenda .ics)
   const FER_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L12 19v-5.5L21 16z"/></svg>';
   const ALERTA_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8l6.5 11.4H1.5z"/><path d="M8 6.2v3.3M8 11.4h.01"/></svg>';
   const INFO_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="8" cy="8" r="6.2"/><path d="M8 7.3v3.6M8 5.2h.01"/></svg>';
   const RE_ID = /^[A-Za-z0-9_-]{1,40}$/, RE_ISO = /^\d{4}-\d{2}-\d{2}$/, RE_COR = /^#[0-9a-fA-F]{6}$/, RE_MES = /^\d{4}-\d{1,2}$/, RE_HORA = /^([01]\d|2[0-3]):[0-5]\d$/;
+  const IDS_RESERVADOS = new Set(["__proto__","constructor","prototype","hasOwnProperty","toString","valueOf","toJSON"]);
+  const idOk = id => RE_ID.test(id) && !IDS_RESERVADOS.has(id);
   const CFG = window.ESCALA_CONFIG || {};
   const NUVEM_ATIVA = !!(CFG.firebase && CFG.firebase.apiKey) && location.protocol !== "file:";
   const UNIDADE = CFG.unidade || "Itaberaba";
@@ -99,18 +101,18 @@
     fonte = Array.isArray(fonte) ? {peritos:fonte} : ((fonte&&typeof fonte==="object") ? fonte : {});
     const vistos=new Set();
     const peritos=(Array.isArray(fonte.peritos)?fonte.peritos:[]).filter(p=>p&&p.nome&&GRUPOS.includes(p.grupo)).map(p=>{
-      let id=String(p.id||""); if(!RE_ID.test(id)||vistos.has(id)) id=uid(); vistos.add(id);
+      let id=String(p.id||""); if(!idOk(id)||vistos.has(id)) id=uid(); vistos.add(id);
       const ferias=(Array.isArray(p.ferias)?p.ferias:[]).filter(f=>f&&RE_ISO.test(f.ini)&&RE_ISO.test(f.fim)&&f.ini<=f.fim)
-        .map(f=>({ini:f.ini, fim:f.fim, tipo:Object.prototype.hasOwnProperty.call(TIPOS_AFAST,f.tipo)?f.tipo:"ferias"}));
+        .map(f=>({ini:f.ini, fim:f.fim, tipo:f.tipo==="atestado"?"outro":(Object.prototype.hasOwnProperty.call(TIPOS_AFAST,f.tipo)?f.tipo:"ferias")}));
       return {id, nome:String(p.nome).trim().slice(0,80)||"?", grupo:p.grupo, ferias};
     });
     const ids=new Set(peritos.map(p=>p.id));
     const equipesBrutas=Array.isArray(fonte.equipes)?fonte.equipes:[];
-    const membrosPorEquipe={}; // para migrar o formato antigo (dia -> equipeId)
+    const membrosPorEquipe=Object.create(null); // para migrar o formato antigo (dia -> equipeId); sem protótipo, para "constructor"/"__proto__" não virarem lixo
     equipesBrutas.forEach(x=>{ if(x&&x.id&&Array.isArray(x.membros)) membrosPorEquipe[String(x.id)]=x.membros.map(String).filter(m=>ids.has(m)); });
     const eqVistos=new Set();
     const equipes=equipesBrutas.filter(x=>x&&Array.isArray(x.membros)).map((x,i)=>{
-      let id=String(x.id||""); if(!RE_ID.test(id)||eqVistos.has(id)) id=uid(); eqVistos.add(id);
+      let id=String(x.id||""); if(!idOk(id)||eqVistos.has(id)) id=uid(); eqVistos.add(id);
       return {
         id,
         membros:[...new Set(x.membros.map(String))].filter(m=>ids.has(m)).slice(0,3),
@@ -128,7 +130,7 @@
         Object.keys(mesObj).forEach(ds=>{
           const d=+ds; if(!Number.isInteger(d)||d<1||d>nd) return;
           const v=mesObj[ds]; let arr=[];
-          if(typeof v==="string") arr=membrosPorEquipe[v]||[];
+          if(typeof v==="string") arr=Array.isArray(membrosPorEquipe[v])?membrosPorEquipe[v]:[];
           else if(Array.isArray(v)) arr=v.map(String).filter(id=>ids.has(id));
           arr=[...new Set(arr)]; if(arr.length) out[d]=arr;
         });
@@ -170,7 +172,7 @@
       const arr=[...new Set(dias[ds].map(String))].filter(id=>ids.has(id)).slice(0,20); if(arr.length) out[d]=arr;
     });
     const eqs=(Array.isArray(equipes)?equipes:[]).filter(x=>x&&Array.isArray(x.membros)).map((x,i)=>({
-      id:RE_ID.test(String(x.id||""))?String(x.id):uid(),
+      id:idOk(String(x.id||""))?String(x.id):uid(),
       membros:[...new Set(x.membros.map(String))].filter(id=>ids.has(id)).slice(0,3),
       cor:RE_COR.test(x.cor)?x.cor:CORES_EQUIPE[i%CORES_EQUIPE.length], recorrente:false, diasPadrao:[]
     })).filter(e=>e.membros.length);
@@ -705,7 +707,7 @@
   }
 
   // --- Agenda (.ics) do perito destacado: importável no Google Agenda, Outlook e celular ---
-  function icsTexto(s){ return String(s).replace(/\\/g,"\\\\").replace(/;/g,"\\;").replace(/,/g,"\\,").replace(/\r?\n/g,"\\n"); }
+  function icsTexto(s){ return String(s).replace(/\\/g,"\\\\").replace(/;/g,"\\;").replace(/,/g,"\\,").replace(/\r?\n/g,"\\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g,""); }
   function icsDobrar(linha){ // linhas de no máximo 75 octetos (RFC 5545)
     const enc=new TextEncoder(); if(enc.encode(linha).length<=75) return linha;
     const partes=[]; let atual="";
@@ -1187,6 +1189,12 @@
     avisarRender();
   }
 
+  // Antes do acesso a página não diz do que se trata: título e subtítulo neutros. O nome real aparece só depois de autorizado.
+  function definirTitulo(real){
+    document.title=real?"Escala de Plantões — "+UNIDADE:"Acesso restrito";
+    document.getElementById("subUnidade").textContent=real?UNIDADE+" · rodízio contínuo de 4 grupos · 24h de plantão, 72h de folga":"";
+  }
+
   // ---------- Tema ----------
   function temaEfetivo(){ const t=prefs.tema||"auto"; if(t!=="auto") return t; return window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches?"escuro":"claro"; }
   function aplicarTema(t){
@@ -1384,6 +1392,7 @@
     }
     estado.destaque=prefs.destaque&&peritoPorId(prefs.destaque)?prefs.destaque:null;
     document.body.dataset.papel=papel; document.body.dataset.editor=ehEditorDef()?"1":"0";
+    definirTitulo(true);
     const tp=document.getElementById("tabBtnProp"); tp.hidden=!(papel==="mestre"||papel==="colaborador");
     tp.querySelector(".t-nome").textContent=papel==="mestre"?"Aprovações":"Propostas";
     setAba(prefs.aba||"oficial");
@@ -1396,6 +1405,7 @@
     aplicarDados({}); hist.atual=JSON.stringify(snapshot()); hist.desfazer=[]; hist.refazer=[];
     histProp.atual=""; histProp.desfazer=[]; histProp.refazer=[];
     document.body.dataset.papel=""; document.body.dataset.editor="0";
+    definirTitulo(false);
     render();
   }
   // Escala definitiva que chegou da nuvem para quem só visualiza (colaborador/leitor).
@@ -1559,8 +1569,7 @@
     estado.viewOficial=prefs.viewOficial||(estreito?"lista":"grade");
     estado.viewExtra=prefs.viewExtra||"grade";
     aplicarTema(prefs.tema||"auto");
-    document.getElementById("subUnidade").textContent=UNIDADE+" · rodízio contínuo de 4 grupos · 24h de plantão, 72h de folga";
-    document.title="Escala de Plantões — "+UNIDADE;
+    definirTitulo(false);
     ligarEventos();
     if(!NUVEM_ATIVA){      // sem Firebase configurado: uso local, como na versão anterior
       if(CFG.firebase&&CFG.firebase.apiKey) Nuvem.info.detalhe="O login com Google só funciona com o app publicado (endereço https), não abrindo o arquivo direto do computador.";

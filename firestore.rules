@@ -57,6 +57,8 @@ service cloud.firestore {
         && request.resource.data.keys().hasOnly(['json', 'rev', 'versao', 'atualizadoEm', 'atualizadoPor', 'dispositivo'])
         && jsonOk(request.resource.data.json)
         && request.resource.data.rev is int
+        && textoOk(request.resource.data.get('dispositivo', ''), 60)
+        && textoOk(request.resource.data.get('atualizadoPor', ''), 120)
         && request.resource.data.atualizadoEm == request.time;
       allow delete: if false;
 
@@ -87,7 +89,9 @@ service cloud.firestore {
           && request.resource.data.keys().hasOnly(['email', 'nome', 'foto', 'status', 'papel', 'solicitadoEm', 'uid', 'decididoEm', 'decididoPor'])
           && request.resource.data.email == id
           && request.resource.data.status in ['pendente', 'autorizado', 'negado']
-          && request.resource.data.get('papel', 'colaborador') in ['leitor', 'colaborador'];
+          && request.resource.data.get('papel', 'colaborador') in ['leitor', 'colaborador']
+          && textoOk(request.resource.data.get('nome', ''), 120)
+          && textoOk(request.resource.data.get('foto', ''), 500);
         allow delete: if ehMestre();
       }
 
@@ -102,7 +106,8 @@ service cloud.firestore {
             && jsonOk(request.resource.data.dias) && request.resource.data.dias.size() < 20000
             && request.resource.data.equipes is string && request.resource.data.equipes.size() < 20000
             && textoOk(request.resource.data.get('observacao', ''), 2000)
-            && textoOk(request.resource.data.get('autorNome', ''), 120);
+            && textoOk(request.resource.data.get('autorNome', ''), 120)
+            && textoOk(request.resource.data.get('dispositivo', ''), 60);
         }
 
         // O autor vê a sua; o administrador vê todas.
@@ -130,13 +135,15 @@ service cloud.firestore {
           && request.resource.data.get('decididoPor', null) == resource.data.get('decididoPor', null)
           && request.resource.data.get('motivo', null) == resource.data.get('motivo', null)
           && (
-            (resource.data.status == 'rascunho' && request.resource.data.status == 'rascunho')
+            (resource.data.status == 'rascunho' && request.resource.data.status == 'rascunho'
+                && request.resource.data.get('enviadoEm', null) == resource.data.get('enviadoEm', null))
             || (resource.data.status == 'rascunho' && request.resource.data.status == 'enviada'
                 && request.resource.data.enviadoEm == request.time)
             || ((resource.data.status == 'enviada' || resource.data.status == 'rejeitada')
                 && request.resource.data.status == 'rascunho'
                 && request.resource.data.dias == resource.data.dias
                 && request.resource.data.equipes == resource.data.equipes
+                && request.resource.data.get('enviadoEm', null) == resource.data.get('enviadoEm', null)
                 && request.resource.data.get('observacao', '') == resource.data.get('observacao', ''))
           );
 
@@ -151,6 +158,8 @@ service cloud.firestore {
           && request.resource.data.mes == resource.data.mes
           && request.resource.data.decididoPor == meuEmail()
           && request.resource.data.decididoEm == request.time
+          && request.resource.data.get('enviadoEm', null) == resource.data.get('enviadoEm', null)
+          && textoOk(request.resource.data.get('dispositivo', ''), 60)
           && textoOk(request.resource.data.get('motivo', ''), 1000);
 
         allow delete: if ehMestre()

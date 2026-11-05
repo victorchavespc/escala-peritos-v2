@@ -84,6 +84,23 @@ Os meses já **fechados** continuam fechados e todos os dias lançados são mant
 - **Nada do que vem de outras pessoas é executado.** Nome, e-mail, observações e motivos são sempre mostrados como texto; fotos só são exibidas se forem do Google. Backups importados e dados da nuvem passam por validação.
 - **Testado com as regras reais** (86 verificações de permissão) e de ponta a ponta (administrador, colaborador, leitor e conta estranha): por exemplo, colaborador não grava a escala definitiva nem aprova a própria proposta, leitor não cria proposta, ninguém lê a escala de outra pessoa nem as versões guardadas, e a revogação vale na hora.
 - Em **computador compartilhado**, use **Sair**. Para colaborador e leitor, a cópia local é apagada ao sair.
+- **A página inicial não revela do que se trata.** Antes de a pessoa ter acesso, título, texto, ícone e descrição são neutros ("Acesso restrito") e a página pede aos buscadores para não ser indexada. O nome real só aparece depois de autorizado.
+- **O motivo médico de afastamentos não é guardado.** Como todos os autorizados veem os afastamentos dos colegas, não existe opção "atestado médico" (registros antigos viram "Afastamento"). Evite escrever motivos de saúde em qualquer campo.
+- **O app não abre dentro de quadro de outro site** (proteção contra clickjacking) e bloqueia plugins, `<base>` e envio de formulários.
+- Campos livres das propostas têm limite de tamanho e o horário de envio é carimbado pelo servidor (um colaborador não consegue inchar documentos nem forjar a hora).
+- Ao aprovar, o app confere se a proposta é **exatamente a que você revisou**; se mudou, avisa e não aplica.
+
+## Checklist de segurança (o que só o administrador pode fazer)
+
+1. **Verificação em duas etapas (ou chave de acesso/passkey) na conta `victorchaves.pc@gmail.com`.** Essa conta é a chave de tudo: quem entrar nela faz tudo.
+2. **Republicar `firestore.rules` no console do Firebase sempre que o arquivo mudar** (Firestore Database › Regras › colar › Publicar). Alterar o arquivo no GitHub **não** atualiza o banco.
+3. **Restringir a chave de API:** Google Cloud Console › APIs e serviços › Credenciais › chave do navegador › Restrições de aplicativos › *Referenciadores HTTP* › `https://victorchavespc.github.io/*` e `https://escala-npf.firebaseapp.com/*`.
+4. **Manter o plano gratuito (Spark)**, sem cartão: assim o pior caso de abuso é a cota acabar, nunca uma cobrança.
+5. Em *Authentication › Método de login*, deixar **somente Google** ligado (e-mail/senha e anônimo desligados).
+6. **Revisar de tempos em tempos** quem está em *Aprovações › Pessoas com acesso* e revogar quem não precisa mais.
+7. **Repositório público:** o nome, o README e o `config.js` mencionam a unidade e a profissão. Quem quiser sigilo total pode tornar o repositório privado (o GitHub Pages em repositório privado exige plano pago; alternativa gratuita: Firebase Hosting) ou renomeá-lo. Se o repositório antigo `escala.peritos` ainda tiver o Pages ativado, ele continua publicando a versão 1 — desative em *Settings › Pages* ou torne-o privado.
+
+**Riscos que continuam, por desenho:** qualquer conta Google pode *pedir* acesso (o administrador nega; não custa nada); um colaborador pode criar muitas propostas (revogue o acesso); quem abrir o código-fonte da página vê os rótulos do app (nunca os dados); o login do Firebase é carregado do servidor do Google (versão fixa).
 
 ## Sem internet
 
@@ -109,7 +126,6 @@ Os meses já **fechados** continuam fechados e todos os dias lançados são mant
 | `config.js` | **configuração**: Firebase, e-mail do administrador, nome da unidade |
 | `firestore.rules` | regras de segurança do banco (copiar para o console do Firebase) |
 | `firebase.json` | uso opcional com o Firebase CLI e emuladores |
-| `index-antigo*.html` | versões anteriores, só para referência |
 
 ## Limites e ideias para depois
 

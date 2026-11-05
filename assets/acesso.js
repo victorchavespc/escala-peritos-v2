@@ -35,7 +35,6 @@
     const a = info.acesso || {}, u = info.usuario;
     raiz.classList.toggle("gated", a.estado !== "ativo");
     if(a.estado === "ativo") { assinaturaGate = ""; return; }
-    $("gateUnidade").textContent = U.UNIDADE;
     const sig = [a.estado, a.detalhe || "", u && u.email, a.solicitadoEm || "", JSON.stringify(a.fontes || null), previaArquivo ? previaArquivo.nome : "", ocupado].join("|");
     if(sig === assinaturaGate) return;
     assinaturaGate = sig;
@@ -45,15 +44,15 @@
     let h;
     switch(a.estado){
       case "deslogado":
-        h = '<h2 id="gateTitulo">Acesso restrito</h2>' +
-          '<p>A escala de plantões de <b>' + esc(U.UNIDADE) + '</b> é restrita aos peritos autorizados. Entre com sua conta Google para continuar.</p>' +
+        h = '<h2 id="gateTitulo">Entre para continuar</h2>' +
+          '<p>Este endereço é de uso restrito. Entre com a sua conta Google; na primeira vez, o administrador precisa liberar o seu acesso.</p>' +
           '<button class="btn-google grande" data-g="entrar">' + GOOGLE + '<span>Entrar com Google</span></button>' +
           '<label class="chk"><input type="checkbox" id="gateLembrar" checked><span>Manter conectado neste aparelho<small>Desmarque em computador compartilhado — a sessão termina ao fechar a aba.</small></span></label>' +
-          '<div class="gate-rodape">Na primeira vez, o administrador precisa liberar o seu acesso. Nome, e-mail e foto da sua conta Google são usados apenas para identificar você aqui.</div>';
+          '<div class="gate-rodape">Nome, e-mail e foto da sua conta Google são usados apenas para identificar você aqui.</div>';
         break;
       case "sem-acesso":
         h = '<h2 id="gateTitulo">Falta pouco</h2>' + pessoa +
-          '<p>Sua conta ainda <b>não tem acesso</b> à escala de ' + esc(U.UNIDADE) + '. Envie um pedido ao administrador — você será avisado nesta tela assim que ele autorizar.</p>' +
+          '<p>Sua conta ainda <b>não tem acesso</b>. Envie um pedido ao administrador — você será avisado nesta tela assim que ele autorizar.</p>' +
           '<div class="gate-acoes"><button class="btn-sm solid" data-g="solicitar"' + (ocupado ? " disabled" : "") + '>' + (ocupado ? "Enviando…" : "Solicitar acesso") + '</button>' + sair + '</div>';
         break;
       case "pendente":
@@ -63,7 +62,7 @@
         break;
       case "negado":
         h = '<h2 id="gateTitulo">Acesso não autorizado</h2>' + pessoa +
-          '<p>O administrador não autorizou esta conta a ver a escala de ' + esc(U.UNIDADE) + '. Se isso for um engano, fale com ele ou entre com outra conta.</p>' +
+          '<p>O administrador não autorizou esta conta. Se isso for um engano, fale com ele ou entre com outra conta.</p>' +
           '<div class="gate-acoes">' + sair + '</div>';
         break;
       case "primeiro-acesso": {
@@ -364,10 +363,20 @@
     if(!sim) return;
     if(await tentar(() => N.api.enviarProposta(p.id))) App.toast("Proposta enviada para aprovação.");
   }
+  // Mesmo conteúdo que o administrador está vendo? (as chaves/ordem do JSON não importam)
+  const canonDias = o => JSON.stringify(Object.keys(o).sort((a, b) => a - b).map(k => [k, [...o[k]].sort()]));
+  function propostaConfere(p){
+    const doc = docDe(p.id);
+    if(!doc || doc.status !== "enviada"){ App.toast("Esta proposta não está mais aguardando aprovação."); return null; }
+    if(canonDias(App.dadosDeProposta(doc).dias) !== canonDias(p.dias)){
+      App.toast("A proposta foi alterada depois que você abriu a revisão. Abra de novo para conferir antes de aprovar.");
+      App.sairProposta(); return null;
+    }
+    return doc;
+  }
   async function aprovar(){
     const p = E.prop; if(!p) return;
-    const doc = docDe(p.id);
-    if(!doc || doc.status !== "enviada"){ App.toast("Esta proposta não está mais aguardando aprovação."); return; }
+    const doc = propostaConfere(p); if(!doc) return;
     const r = App.resumoProposta(doc), fechado = App.mesFechado(doc.mes);
     let fechar = true;
     const res = await App.dialogo({
@@ -378,6 +387,7 @@
       botoes: [{ id: "nao", rotulo: "Cancelar" }, { id: "sim", rotulo: "Aprovar e aplicar", estilo: "solid", aoClicar: c => { fechar = c.querySelector("#aprFechar").checked; } }]
     });
     if(res !== "sim") return;
+    if(!propostaConfere(p)) return;   // o diálogo pode ter ficado aberto: confere de novo antes de aplicar
     if(!App.aplicarPropostaNaDefinitiva(doc, fechar)){ App.toast("Não foi possível aplicar a proposta."); return; }
     try{
       await N.api.decidirProposta(doc.id, { status: "aprovada" });
